@@ -13,7 +13,7 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     commit_command,
-    geometry::snap_point,
+    geometry::{points_coincident, snap_point},
     parse_sexp, prepare_command,
     schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
@@ -199,15 +199,24 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_connected",
-            "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
-            // No parameters: the handler refuses unconditionally, and the
-            // schema-parameter guard (rightly) refuses a schema that advertises
-            // arguments nothing reads. The old parameters are documented in
-            // docs/API_MIGRATIONS.md alongside #285's removals.
+            "Move a component's lowest-numbered unit to a new position (translating every \
+             other placed unit by the same delta, like move_schematic_component) and carry \
+             everything anchored at its old pin positions: labels (net/global/hierarchical) \
+             and power symbols whose position coincided with a pin, no-connect flags, and the \
+             touching end of any wire. A wire end is stretched only if the wire stays \
+             horizontal or vertical; if any wire would go diagonal, the WHOLE move is refused \
+             before anything is written, naming the wire(s) and a delta along their own axis \
+             that would stay orthogonal. Junction dots are re-judged the same way \
+             move_schematic_component does (junctions_pruned_count/junctions_added_count).",
             json!({
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "reference": { "type": "string" },
+                    "x": { "type": "number", "description": "New X position in mm" },
+                    "y": { "type": "number", "description": "New Y position in mm" }
+                },
+                "required": ["schematic", "reference", "x", "y"]
             }),
             |args, ctx| async move { handle_move_connected(args, ctx).await }
         ),
@@ -2526,18 +2535,250 @@ async fn handle_rotate_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+/// Pin endpoints (every placed unit) of one reference, stripped down to bare
+/// coordinates from the same lookup `pin_locations_for_reference` uses for the
+/// public `get_schematic_pin_locations` tool — one source of truth for "what
+/// counts as this component's pin" rather than a second geometry walk.
+fn reference_pin_points(
+    tree: &konnect_sexp::SexpNode,
+    reference: &str,
+) -> Result<Vec<(f64, f64)>, String> {
+    let info = pin_locations_for_reference(tree, reference)?;
+    Ok(info["pins"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| Some((p.get("x")?.as_f64()?, p.get("y")?.as_f64()?)))
+        .collect())
+}
+
+/// Move a symbol and carry everything anchored at its old pin positions:
+/// labels (net/global/hierarchical), power symbols, no-connect flags, and the
+/// touching end of any wire — refusing the whole move, before writing
+/// anything, if stretching a wire would make it diagonal (#315).
+///
+/// Junction dots are re-judged exactly the way `move_schematic_component`
+/// already does (#120): a before/after diff of every pin on the sheet decides
+/// what to prune or add, so this does not need its own opinion about
+/// junctions beyond calling the same reconciliation pass.
 async fn handle_move_connected(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // Since the first release this silently delegated to the plain move and
-    // reported success — the symbol moved, every wire stayed put, and the
-    // caller was told the connections were preserved (#315). A tool must not
-    // claim work it does not do: refuse until the wire-carrying move exists
-    // (it needs #120's connectivity model to know which wires to stretch).
-    Ok(CallToolResult::error(
-        "move_connected is not implemented: it used to move the symbol and leave          every wire behind while reporting the connections preserved. Use          move_schematic_component (moves the symbol only), then re-route or use          connect_pins for the affected nets. Wire-carrying moves are tracked in          issue #315 and depend on the connectivity work in #120.",
-    ))
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(r) => r.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let new_x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let new_y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
+
+    const PIN_TOL: f64 = 0.01;
+
+    // Snapshot pin geometry BEFORE any mutation: the moved reference's own
+    // pins (what was anchored to them) and, if the sheet has any wires at
+    // all, every pin on the sheet (for the junction reconciliation below).
+    let (content, tree) = read_schematic(&sch_path)?;
+    let old_pins = match reference_pin_points(&tree, &reference) {
+        Ok(p) => p,
+        Err(e) => return Ok(CallToolResult::error(e)),
+    };
+    let before_pins = if content.contains("(wire") {
+        crate::tools::all_pin_endpoints(&tree)
+    } else {
+        Vec::new()
+    };
+    let at_old_pin = |x: f64, y: f64| {
+        old_pins
+            .iter()
+            .any(|&(px, py)| points_coincident(x, y, px, py, PIN_TOL))
+    };
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+
+    let Some(anchor) = sch
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+        .min_by_key(|symbol| symbol.unit)
+    else {
+        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+    };
+    let (old_x, old_y) = anchor.position();
+    let (dx, dy) = (new_x - old_x, new_y - old_y);
+
+    // ---- Refusal pass FIRST: every wire with exactly one endpoint on an old
+    // pin must still be horizontal or vertical once that endpoint is
+    // stretched by (dx, dy), or nothing gets written at all. A wire with
+    // BOTH endpoints on old pins translates whole and keeps its shape either
+    // way, so it can never go diagonal.
+    let mut violations = Vec::new();
+    for wire in sch.wires.iter() {
+        let (x1, y1) = wire.start;
+        let (x2, y2) = wire.end;
+        let hit1 = at_old_pin(x1, y1);
+        let hit2 = at_old_pin(x2, y2);
+        if hit1 == hit2 {
+            continue;
+        }
+        let ((mx, my), (ox, oy)) = if hit1 {
+            ((x1, y1), (x2, y2))
+        } else {
+            ((x2, y2), (x1, y1))
+        };
+        let (nx, ny) = (mx + dx, my + dy);
+        let stays_orthogonal = (nx - ox).abs() <= PIN_TOL || (ny - oy).abs() <= PIN_TOL;
+        if stays_orthogonal {
+            continue;
+        }
+        let is_horizontal = (y1 - y2).abs() <= PIN_TOL;
+        let is_vertical = (x1 - x2).abs() <= PIN_TOL;
+        let suggestion = if is_horizontal {
+            format!("move along its own horizontal axis instead: dx={dx:.3}, dy=0")
+        } else if is_vertical {
+            format!("move along its own vertical axis instead: dx=0, dy={dy:.3}")
+        } else {
+            "move along one of the wire's own endpoints so it stays aligned".to_string()
+        };
+        violations.push(format!(
+            "wire ({x1:.3},{y1:.3})-({x2:.3},{y2:.3}) would go diagonal — {suggestion}"
+        ));
+    }
+    if !violations.is_empty() {
+        let message = format!(
+            "move_connected refused: moving {reference} by ({dx:.3}, {dy:.3}) would make \
+             {} wire(s) diagonal; nothing was written.\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::WouldGoDiagonal {
+                reference: reference.clone(),
+                dx,
+                dy,
+                wires: violations,
+            },
+            message,
+        ));
+    }
+
+    // ---- Move the symbol itself: every placed unit, by the same shared
+    // delta (identical to move_schematic_component).
+    let mut placements = Vec::new();
+    for symbol in sch
+        .symbols
+        .iter_mut()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+    {
+        symbol.translate(dx, dy);
+        placements.push(json!({
+            "unit": symbol.unit,
+            "x": symbol.at.x,
+            "y": symbol.at.y
+        }));
+    }
+
+    // ---- Carry labels anchored at an old pin position.
+    let mut labels_moved = Vec::new();
+    for label in sch.labels.iter_mut() {
+        let (x, y) = label.position();
+        if at_old_pin(x, y) {
+            label.translate(dx, dy);
+            labels_moved.push(json!({ "kind": "label", "text": label.text }));
+        }
+    }
+    for label in sch.global_labels.iter_mut() {
+        let (x, y) = label.position();
+        if at_old_pin(x, y) {
+            label.translate(dx, dy);
+            labels_moved.push(json!({ "kind": "global_label", "text": label.text }));
+        }
+    }
+    for label in sch.hierarchical_labels.iter_mut() {
+        let (x, y) = label.position();
+        if at_old_pin(x, y) {
+            label.translate(dx, dy);
+            labels_moved.push(json!({ "kind": "hierarchical_label", "text": label.text }));
+        }
+    }
+
+    // ---- Carry power symbols whose own position (their single pin) sat on
+    // an old pin of the symbol being moved. The symbol just moved above is
+    // excluded by reference, not by lib_id, so a component that happens to
+    // share a reference with itself is never double-counted.
+    let mut power_symbols_moved = Vec::new();
+    for symbol in sch.symbols.iter_mut() {
+        if symbol.reference() == Some(reference.as_str()) {
+            continue;
+        }
+        if !symbol.lib_id.starts_with("power:") {
+            continue;
+        }
+        let (x, y) = symbol.position();
+        if at_old_pin(x, y) {
+            symbol.translate(dx, dy);
+            power_symbols_moved.push(symbol.reference().unwrap_or_default().to_string());
+        }
+    }
+
+    // ---- Carry no-connect flags anchored at an old pin position.
+    let mut no_connects_moved = 0usize;
+    for nc in sch.no_connects.iter_mut() {
+        if at_old_pin(nc.x, nc.y) {
+            nc.x += dx;
+            nc.y += dy;
+            no_connects_moved += 1;
+        }
+    }
+
+    // ---- Stretch wire endpoints anchored at an old pin position — already
+    // proven to stay orthogonal by the refusal pass above.
+    let mut wire_endpoints_moved = 0usize;
+    for wire in sch.wires.iter_mut() {
+        let (x1, y1) = wire.start;
+        let (x2, y2) = wire.end;
+        let hit1 = at_old_pin(x1, y1);
+        let hit2 = at_old_pin(x2, y2);
+        if hit1 && hit2 {
+            wire.translate(dx, dy);
+            wire_endpoints_moved += 2;
+        } else if hit1 {
+            wire.start = (x1 + dx, y1 + dy);
+            wire_endpoints_moved += 1;
+        } else if hit2 {
+            wire.end = (x2 + dx, y2 + dy);
+            wire_endpoints_moved += 1;
+        }
+    }
+
+    sch.overwrite()?;
+
+    let (junctions_added, junctions_pruned) =
+        reconcile_junctions_after_move(&sch_path, &before_pins)?;
+
+    Ok(CallToolResult::json(&json!({
+        "moved": reference,
+        "x": new_x,
+        "y": new_y,
+        "moved_units": placements.len(),
+        "placements": placements,
+        "labels_moved_count": labels_moved.len(),
+        "labels_moved": labels_moved,
+        "power_symbols_moved_count": power_symbols_moved.len(),
+        "power_symbols_moved": power_symbols_moved,
+        "no_connects_moved_count": no_connects_moved,
+        "wire_endpoints_moved_count": wire_endpoints_moved,
+        "junctions_added_count": junctions_added,
+        "junctions_pruned_count": junctions_pruned
+    })))
 }
 
 async fn handle_move_region(
@@ -5300,41 +5541,308 @@ mod schematic_view_tests {
 #[cfg(test)]
 mod move_connected_tests {
     use super::*;
+    use crate::mcp::error::extract_error_kind;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
 
-    /// #315: this tool silently delegated to the plain move since the first
-    /// release — symbol moved, wires stayed, success reported. Until the
-    /// wire-carrying move exists it must refuse, naming the alternative.
+    /// R1: a four-pin part with a pin 1.27mm N/S/E/W of its anchor. North
+    /// carries a net label, south a GND power symbol, east a no-connect,
+    /// west a horizontal wire stub — one fixture exercising every kind of
+    /// attachment #315 asks `move_connected` to carry. Coordinates are
+    /// chosen as exact multiples of the 1.27mm grid so `snap_point` in the
+    /// handler is a no-op and the arithmetic below is exact.
+    const SCHEMATIC: &str = r##"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (generator_version "10.0")
+  (uuid "10000000-0000-4000-8000-000000000000")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Test:R"
+      (pin input line (at 0 1.27 0) (length 0) (name "N") (number "1"))
+      (pin output line (at 0 -1.27 0) (length 0) (name "S") (number "2"))
+      (pin passive line (at 1.27 0 0) (length 0) (name "E") (number "3"))
+      (pin passive line (at -1.27 0 0) (length 0) (name "W") (number "4"))
+    )
+    (symbol "power:GND"
+      (power)
+      (pin power_in line (at 0 0 0) (length 0) (name "GND") (number "1"))
+    )
+  )
+  (no_connect (at 13.97 12.7) (uuid "20000000-0000-4000-8000-000000000001"))
+  (wire
+    (pts (xy 11.43 12.7) (xy 8.89 12.7))
+    (stroke (width 0) (type default))
+    (uuid "20000000-0000-4000-8000-000000000002")
+  )
+  (label "NET_TOP" (at 12.7 11.43 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "20000000-0000-4000-8000-000000000003")
+  )
+  (symbol
+    (lib_id "power:GND")
+    (at 12.7 13.97 0)
+    (unit 1)
+    (uuid "20000000-0000-4000-8000-000000000004")
+    (property "Reference" "#PWR01" (at 12.7 16.51 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "GND" (at 12.7 15.24 0) (effects (font (size 1.27 1.27))))
+    (instances
+      (project "test"
+        (path "/10000000-0000-4000-8000-000000000000"
+          (reference "#PWR01")
+          (unit 1)
+        )
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:R")
+    (at 12.7 12.7 0)
+    (unit 1)
+    (uuid "20000000-0000-4000-8000-000000000005")
+    (property "Reference" "R1" (at 15.24 12.7 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "10k" (at 17.78 12.7 0) (effects (font (size 1.27 1.27))))
+    (property "Footprint" "" (at 12.7 12.7 0) (effects (font (size 1.27 1.27))))
+    (property "Datasheet" "" (at 12.7 12.7 0) (effects (font (size 1.27 1.27))))
+    (instances
+      (project "test"
+        (path "/10000000-0000-4000-8000-000000000000"
+          (reference "R1")
+          (unit 1)
+        )
+      )
+    )
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"##;
+
+    /// U1: a two-unit part with no wires at all, so the multi-unit test does
+    /// not have to reason about the carry/refusal logic — only that every
+    /// placed unit follows the same shared delta, like
+    /// `move_schematic_component`.
+    const MULTI_UNIT_SCHEMATIC: &str = r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (generator_version "10.0")
+  (uuid "30000000-0000-4000-8000-000000000000")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Test:DUAL2"
+      (symbol "DUAL2_1_1"
+        (pin input line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "DUAL2_2_1"
+        (pin output line (at 0 0 0) (length 0) (name "Y") (number "2"))
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:DUAL2")
+    (at 12.7 12.7 0)
+    (unit 1)
+    (uuid "30000000-0000-4000-8000-000000000001")
+    (property "Reference" "U1" (at 12.7 10.16 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "DUAL2" (at 12.7 7.62 0) (effects (font (size 1.27 1.27))))
+    (instances
+      (project "test"
+        (path "/30000000-0000-4000-8000-000000000000"
+          (reference "U1")
+          (unit 1)
+        )
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:DUAL2")
+    (at 12.7 25.4 0)
+    (unit 2)
+    (uuid "30000000-0000-4000-8000-000000000002")
+    (property "Reference" "U1" (at 12.7 22.86 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "DUAL2" (at 12.7 20.32 0) (effects (font (size 1.27 1.27))))
+    (instances
+      (project "test"
+        (path "/30000000-0000-4000-8000-000000000000"
+          (reference "U1")
+          (unit 2)
+        )
+      )
+    )
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"#;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("move_connected.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "mutation unexpectedly failed");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    const TOL: f64 = 0.01;
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= TOL
+    }
+
     #[tokio::test]
-    async fn move_connected_refuses_instead_of_faking_success() {
+    async fn labels_power_and_no_connects_are_carried_and_the_orthogonal_wire_end_is_stretched() {
+        let (_directory, path) = fixture(SCHEMATIC);
+
+        let result = body(
+            handle_move_connected(
+                &json!({ "schematic": path, "reference": "R1", "x": 25.4, "y": 12.7 }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Response counts, all derived from what the handler actually moved.
+        assert_eq!(result["moved_units"], 1);
+        assert_eq!(result["labels_moved_count"], 1, "{result}");
+        assert_eq!(result["power_symbols_moved_count"], 1, "{result}");
+        assert_eq!(result["no_connects_moved_count"], 1, "{result}");
+        assert_eq!(result["wire_endpoints_moved_count"], 1, "{result}");
+        assert_eq!(result["junctions_added_count"], 0, "{result}");
+        assert_eq!(result["junctions_pruned_count"], 0, "{result}");
+
+        // Read the file back rather than trusting the handler's self-report.
+        let sch = cse::Schematic::load(&path).unwrap();
+        let r1 = sch.symbols.by_reference("R1").unwrap();
+        assert!(close(r1.at.x, 25.4) && close(r1.at.y, 12.7), "{:?}", r1.at);
+
+        let label = sch.labels.iter().find(|l| l.text == "NET_TOP").unwrap();
+        assert!(
+            close(label.at.x, 25.4) && close(label.at.y, 11.43),
+            "label must follow the pin it sat on: {:?}",
+            label.at
+        );
+
+        let pwr = sch.symbols.by_reference("#PWR01").unwrap();
+        assert!(
+            close(pwr.at.x, 25.4) && close(pwr.at.y, 13.97),
+            "power symbol must follow the pin it sat on: {:?}",
+            pwr.at
+        );
+
+        assert_eq!(sch.no_connects.len(), 1);
+        assert!(
+            close(sch.no_connects[0].x, 26.67) && close(sch.no_connects[0].y, 12.7),
+            "no-connect must follow the pin it sat on: {:?}",
+            (sch.no_connects[0].x, sch.no_connects[0].y)
+        );
+
+        assert_eq!(sch.wires.len(), 1);
+        let wire = &sch.wires[0];
+        // The end that sat on the moved pin follows it; the free end at
+        // (8.89, 12.7) never moves.
+        assert!(
+            (close(wire.start.0, 24.13)
+                && close(wire.start.1, 12.7)
+                && close(wire.end.0, 8.89)
+                && close(wire.end.1, 12.7))
+                || (close(wire.end.0, 24.13)
+                    && close(wire.end.1, 12.7)
+                    && close(wire.start.0, 8.89)
+                    && close(wire.start.1, 12.7)),
+            "wire endpoint on the pin must move, the free end must not: {:?}",
+            (wire.start, wire.end)
+        );
+        assert!(
+            wire.is_horizontal(),
+            "the stretched wire must stay orthogonal"
+        );
+    }
+
+    /// Same fixture, but the requested delta has a Y component — the west
+    /// pin's horizontal wire stub would end up neither horizontal nor
+    /// vertical. The whole move must be refused before anything is written,
+    /// even though the label/power/no-connect carries would have succeeded.
+    #[tokio::test]
+    async fn a_move_that_would_put_a_wire_off_axis_is_refused_and_nothing_is_written() {
+        let (_directory, path) = fixture(SCHEMATIC);
+        let before = std::fs::read(&path).unwrap();
+
         let result = handle_move_connected(
-            &serde_json::json!({
-                "schematic": "unused.kicad_sch",
-                "reference": "R1", "x": 10.0, "y": 10.0
-            }),
-            &crate::tools::ToolContext::new(
-                crate::tools::ServerConfig {
-                    kicad_cli: String::new(),
-                    kicad_binary: String::new(),
-                    ipc_address: String::new(),
-                    project_dir: None,
-                    jlcpcb_db_path: None,
-                    auto_load_toolsets: false,
-                    eager_toolsets: false,
-                },
-                std::sync::Arc::new(crate::router::ToolRouter::new()),
-            ),
+            &json!({ "schematic": path, "reference": "R1", "x": 25.4, "y": 13.97 }),
+            &context(),
         )
         .await
         .unwrap();
 
         assert!(result.is_error);
-        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("would_go_diagonal")
+        );
+        let ToolContent::Text { text } = &result.content[0] else {
             panic!("expected text");
         };
         assert!(
-            text.contains("move_schematic_component"),
-            "must name the working alternative: {text}"
+            text.contains("8.89") || text.contains("11.43"),
+            "must name the offending wire: {text}"
         );
+        assert!(
+            text.contains("dx=") || text.contains("axis"),
+            "must suggest an orthogonal-preserving delta: {text}"
+        );
+
+        // Refusal path proven before the success path: nothing was written.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "file must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_unit_symbol_moves_every_placed_unit_by_the_shared_delta() {
+        let (_directory, path) = fixture(MULTI_UNIT_SCHEMATIC);
+
+        let result = body(
+            handle_move_connected(
+                &json!({ "schematic": path, "reference": "U1", "x": 25.4, "y": 12.7 }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["moved_units"], 2, "{result}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let mut units: Vec<_> = sch
+            .symbols
+            .iter()
+            .filter(|s| s.reference() == Some("U1"))
+            .collect();
+        units.sort_by_key(|s| s.unit);
+        assert!(close(units[0].at.x, 25.4) && close(units[0].at.y, 12.7));
+        assert!(close(units[1].at.x, 25.4) && close(units[1].at.y, 25.4));
     }
 }
 

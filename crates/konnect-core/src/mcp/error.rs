@@ -67,6 +67,15 @@ pub enum ToolErrorKind {
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
+    /// A wire-carrying move would leave a stretched wire off the horizontal/
+    /// vertical grid. Refused before any write; `wires` names the offending
+    /// segment(s) so the caller can retry with a delta along their own axis.
+    WouldGoDiagonal {
+        reference: String,
+        dx: f64,
+        dy: f64,
+        wires: Vec<String>,
+    },
 }
 
 impl ToolErrorKind {
@@ -84,6 +93,7 @@ impl ToolErrorKind {
             Self::StaleTarget { .. } => "stale_target",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::HandlerError { .. } => "handler_error",
+            Self::WouldGoDiagonal { .. } => "would_go_diagonal",
         }
     }
 }
@@ -216,6 +226,12 @@ mod tests {
             },
             ToolErrorKind::UnsafeFileFallback { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
+            ToolErrorKind::WouldGoDiagonal {
+                reference: "R1".into(),
+                dx: 1.0,
+                dy: 2.0,
+                wires: vec!["p".into()],
+            },
         ];
         for kind in kinds {
             let code = kind.short_code();
