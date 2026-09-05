@@ -2,6 +2,66 @@ use crate::error::{Error, Result};
 use crate::sexp::{atom, qstr, tagged, SexpNode};
 use crate::types::{fmt_f64, At, Effects, Property};
 
+// ---- SheetEdge ----------------------------------------------------------------
+
+/// A border of a sheet box. A sheet pin's name has to read *into* the box; the
+/// `(justify …)` that does so depends only on which edge the pin sits on, and
+/// the wrong token leaves the name hanging in the gutter between sheets with
+/// every wire from the pin crossing it (Konnect issue #18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl SheetEdge {
+    /// The `(justify …)` token that points a pin's text inward on this edge.
+    ///
+    /// Left/right verified against eeschema (right edge `right`, left edge
+    /// `left`); top/bottom follow KiCad's spin-style mapping (top `right`,
+    /// bottom `left`). This is the *opposite* of `label_justify`, which keys
+    /// off rotation rather than edge — a sheet pin's rotation names its edge,
+    /// so the mapping inverts.
+    pub fn pin_justify(self) -> &'static str {
+        match self {
+            SheetEdge::Left => "left",
+            SheetEdge::Right => "right",
+            SheetEdge::Top => "right",
+            SheetEdge::Bottom => "left",
+        }
+    }
+
+    /// Classify a point against a sheet box `(x0, y0)`–`(x1, y1)`, returning the
+    /// edge it lies on within `tol` mm, or `None` when it is off the perimeter.
+    /// Left/right are tested before top/bottom, so a corner resolves to a
+    /// vertical edge.
+    pub fn classify(
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        x: f64,
+        y: f64,
+        tol: f64,
+    ) -> Option<SheetEdge> {
+        let within_y = y0 - tol <= y && y <= y1 + tol;
+        let within_x = x0 - tol <= x && x <= x1 + tol;
+        if (x - x0).abs() <= tol && within_y {
+            Some(SheetEdge::Left)
+        } else if (x - x1).abs() <= tol && within_y {
+            Some(SheetEdge::Right)
+        } else if (y - y0).abs() <= tol && within_x {
+            Some(SheetEdge::Top)
+        } else if (y - y1).abs() <= tol && within_x {
+            Some(SheetEdge::Bottom)
+        } else {
+            None
+        }
+    }
+}
+
 // ---- SheetPin -----------------------------------------------------------------
 
 /// A parent-side connection point on a `(sheet ...)` block. Must be paired with
@@ -72,6 +132,34 @@ impl SheetPin {
 
     pub fn position(&self) -> (f64, f64) {
         (self.at.x, self.at.y)
+    }
+
+    /// Give the pin an `(effects …)` block whose `(justify …)` makes its name
+    /// read into the sheet box. The font of any existing effects is preserved
+    /// and only the justify is replaced; a pin with no effects yet gets the
+    /// default 1.27 mm font. Callers derive `justify` from the pin's edge via
+    /// [`SheetEdge::pin_justify`].
+    pub fn set_pin_justify(&mut self, justify: &str) {
+        let justify_node = SexpNode::List(vec![atom("justify"), atom(justify)]);
+        let effects = match self.effects.take() {
+            Some(Effects(SexpNode::List(children))) => {
+                let mut out: Vec<SexpNode> = children
+                    .into_iter()
+                    .filter(|c| c.tag() != Some("justify"))
+                    .collect();
+                out.push(justify_node);
+                SexpNode::List(out)
+            }
+            _ => SexpNode::List(vec![
+                atom("effects"),
+                tagged(
+                    "font",
+                    vec![tagged("size", vec![atom("1.27"), atom("1.27")])],
+                ),
+                justify_node,
+            ]),
+        };
+        self.effects = Some(Effects(effects));
     }
 }
 
@@ -371,6 +459,21 @@ impl Sheet {
 
     // ---- pins -------------------------------------------------------------------
 
+    /// Which border edge the point `(x, y)` lies on, within `tol` mm, or `None`
+    /// when it is not on the box perimeter. Used to pick a sheet pin's justify
+    /// so its name reads into the box.
+    pub fn edge_at(&self, x: f64, y: f64, tol: f64) -> Option<SheetEdge> {
+        SheetEdge::classify(
+            self.at.x,
+            self.at.y,
+            self.at.x + self.width,
+            self.at.y + self.height,
+            x,
+            y,
+            tol,
+        )
+    }
+
     pub fn add_pin(&mut self, pin: SheetPin) {
         self.pins.push(pin);
     }
@@ -564,6 +667,50 @@ mod tests {
             file.contains("(at 100") && file.contains("80.4"),
             "Sheetfile must sit just below the box, got: {file}"
         );
+    }
+
+    #[test]
+    fn edge_at_classifies_each_border_and_rejects_interior() {
+        // Box (10,10)–(70,50).
+        let sheet = Sheet::new("A", "a.kicad_sch", 10.0, 10.0, 60.0, 40.0);
+        assert_eq!(sheet.edge_at(10.0, 30.0, 0.05), Some(SheetEdge::Left));
+        assert_eq!(sheet.edge_at(70.0, 30.0, 0.05), Some(SheetEdge::Right));
+        assert_eq!(sheet.edge_at(40.0, 10.0, 0.05), Some(SheetEdge::Top));
+        assert_eq!(sheet.edge_at(40.0, 50.0, 0.05), Some(SheetEdge::Bottom));
+        assert_eq!(sheet.edge_at(40.0, 30.0, 0.05), None); // interior
+        assert_eq!(sheet.edge_at(200.0, 200.0, 0.05), None); // far outside
+    }
+
+    #[test]
+    fn edge_justify_reads_into_the_box() {
+        // The mapping the whole fix hangs on: right→right, left→left, top→right,
+        // bottom→left (Konnect #18).
+        assert_eq!(SheetEdge::Right.pin_justify(), "right");
+        assert_eq!(SheetEdge::Left.pin_justify(), "left");
+        assert_eq!(SheetEdge::Top.pin_justify(), "right");
+        assert_eq!(SheetEdge::Bottom.pin_justify(), "left");
+    }
+
+    #[test]
+    fn set_pin_justify_writes_effects_and_survives_roundtrip() {
+        let mut pin = SheetPin::new("OUT", "output", 70.0, 30.0);
+        assert!(pin.effects.is_none());
+        pin.set_pin_justify("right");
+        let out = crate::sexp::writer::write(&pin.to_sexp());
+        assert!(
+            out.contains("(justify right)"),
+            "sheet pin must carry its edge's justify, got: {out}"
+        );
+        assert!(
+            out.contains("(size 1.27 1.27)"),
+            "a fresh justify must bring the default font, got: {out}"
+        );
+        // Re-justify replaces, never stacks a second token.
+        pin.set_pin_justify("left");
+        let out = crate::sexp::writer::write(&pin.to_sexp());
+        assert!(out.contains("(justify left)"), "{out}");
+        assert!(!out.contains("(justify right)"), "{out}");
+        assert_eq!(out.matches("(justify").count(), 1, "{out}");
     }
 
     #[test]
