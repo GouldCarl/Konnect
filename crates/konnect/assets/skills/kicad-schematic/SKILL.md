@@ -95,7 +95,22 @@ the order pins appear on screen.
 - 180 degrees: flipped horizontally
 - 270 degrees: rotated CW
 
-Power symbols: GND uses 0 (arrow points down), VCC/VDD/+3V3/+5V use 0 (arrow points up).
+Power symbols connect by coincidence, not orientation, but the wrong rotation draws
+the arrow back across the part it powers. The arrow always extends the *same*
+direction the target pin already points — call `get_schematic_pin_locations` for its
+`orientation_degrees` and look it up:
+
+| Target pin's `orientation_degrees` | `GND` rotation | `VCC`/`VDD`/`+3V3`/`+5V` rotation |
+|---|---|---|
+| 0 (right) | 90  | 270 |
+| 90 (up)   | 180 | 0   |
+| 180 (left)| 270 | 90  |
+| 270 (down)| 0   | 180 |
+
+"GND uses 0" only holds for a downward-facing pin (an IC's bottom pin); "VCC uses 0"
+only for an upward-facing one (a cap's top pin) — both common, but a pin facing left
+or right (connectors, horizontal IC edges, rotated passives) needs a different
+rotation from the table.
 
 ### Spacing Guidelines
 
@@ -117,24 +132,42 @@ pattern.
 
 | Scenario                                | Method                  | Why                                      |
 |-----------------------------------------|-------------------------|------------------------------------------|
-| Two pins physically close (<30mm)       | `connect_pins`          | Direct wire, auto-routed                 |
+| Two pins physically close (<30mm)       | `connect_to_net` (shared net name) | Stub wire + net label, no route to check |
 | Named signal (SDA, MOSI, EN, etc.)      | `connect_to_net`        | Stub wire + net label, cleaner           |
 | Power rail (VCC, GND, +3V3)             | `add_power_symbol`      | Proper power symbol, global net          |
 | Bus signals (D0-D7)                     | `connect_to_net`        | Net labels with bus naming               |
 | Cross-sheet signal                      | Global label            | Connects across schematic sheets         |
 | Multiple pins to same net (3+)          | `batch_connect_to_net`  | Efficient bulk operation                 |
+| Two pins with a confirmed clear path    | `connect_pins` (opt-in — see warning) | Direct wire, auto-routed        |
 
 ### connect_pins
 
-Use for direct pin-to-pin connections. The tool auto-routes with L-bends.
+**Opt-in, not the default** — read this before reaching for it. The auto-router draws
+a straight H+V(+H) path between the two pins with no check for what that path
+crosses:
+
+- If the route's bend or run shares an X or Y coordinate with a *third* component's
+  pin in between, that pin joins the net silently — no warning, no error.
+- If the two endpoints are two pins of the *same* symbol (e.g. a crystal's `XTAL1`
+  and `XTAL2`), the "wire" is a dead short between them, and anything that was meant
+  to sit electrically between those pins (the crystal itself, in that example) ends
+  up in no net at all — Konnect treats a pin landing mid-span on a wire as connected;
+  KiCad does not.
+
+Use it only for a single, unambiguous point-to-point run where you have checked
+the two components' other pins do not fall on the drawn path's X or Y range.
+Afterwards run `find_shorted_nets` (`validate_wire_connections` /
+`validate_component_connections` will not catch either failure — see Post-Placement
+Verification below). Prefer `connect_to_net` for anything else, including two nearby
+pins that just need to end up on the same net.
 
 ```
 connect_pins(schematic, ref1, pin1, ref2, pin2)
 ```
 
 - Specify pins by pin number (from get_schematic_pin_locations)
-- Works best when pins are nearby and facing each other
-- Automatically creates wire segments with proper bends
+- Works best when pins are nearby and facing each other, with nothing between them
+- Automatically creates wire segments with proper bends — unchecked ones
 
 ### connect_to_net
 
@@ -151,8 +184,15 @@ connect_to_net(schematic, reference, pin_number, net)
 - Name the pin rather than passing `pin_x`/`pin_y`: the stub then points away
   from the symbol body on its own, instead of the label text running back
   across the pin names. Override with `direction` only to fix a layout clash.
-- `batch_connect_to_net` does the same for many pins in one read/write, and
-  places its labels directly on the pin endpoints without stubs.
+- `batch_connect_to_net` does the same for many pins in one read/write, but places
+  its labels directly on the pin endpoints with **no stub** — fine when neighbouring
+  pins are well spaced, but on a tight pitch (a resistor/cap pair, adjacent header
+  pins) the text overprints the neighbour. Its `pins` array takes
+  `{reference, pin_number}` items under a top-level `net_name`; this is not the same
+  shape as `batch_connect_pins`' `connections` array of `{ref1, pin1, ref2, pin2}` —
+  check the tool schema rather than assuming one carries over to the other.
+- On a tight pitch, prefer per-pin `connect_to_net` calls (its default 2.54 mm stub
+  keeps the label clear) over `batch_connect_to_net`.
 - Placing a label by hand with `add_schematic_net_label` instead? Take its
   rotation from `orientation_degrees` in `get_schematic_pin_locations`, or the
   text reads back across the symbol's pin names.
@@ -168,10 +208,16 @@ add_power_symbol(schematic, power_net, x, y, rotation?)
 - Takes coordinates, not a reference and pin number. Place it on the pin
   endpoint (from `get_schematic_pin_locations`) — a power symbol carries its
   pin at its own origin, so the two coinciding is the connection.
+- Landed straight on the pin, two power symbols on pins closer than ~5 mm apart
+  (an IC's VDD/VSS pair, two pins of a passive) overprint each other's Value
+  text. On that pitch, place the symbol a 2.54 mm stub away along the pin's
+  outward direction instead and join it to the pin with `add_wire` — the same
+  technique `connect_to_net` uses for its stub.
 - `power_net` is loaded as `power:<power_net>`, so it must name a symbol in
   KiCad's power library: `+3V3` and `+12V`, never `3V3` or `12V`. A miss is an
   error and nothing is placed.
-- `rotation` defaults to 0 — see Rotation Conventions above.
+- `rotation` defaults to 0, which is only correct for one pin direction per
+  symbol type — see Rotation Conventions above for the full table.
 - A power pin landing mid-segment on a wire gets its junction dot
   automatically, in either order: symbol onto an existing wire, or a wire
   routed across an already-placed symbol.
@@ -240,10 +286,17 @@ Checks that all wires connect properly to pins. Reports:
 - Wires that miss pins
 - Overlapping wires
 
+**Does not check which net a pin ends up on** — a pin merged onto the wrong net by
+a `connect_pins` collision still "has a wire" and reports clean. Use
+`export_netlist_summary` or `find_shorted_nets` for net-level correctness.
+
 ### validate_component_connections
 Verifies that components have the expected connections. Reports:
 - Unconnected pins that should be connected
 - Missing power connections
+
+Same limitation as above: it checks that a pin touches *something*, not which net
+that something belongs to.
 
 ### find_orphan_items
 Finds floating wires, labels, and symbols that are not connected to anything.
@@ -252,11 +305,16 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 
 1. Place and wire complete functional blocks.
 2. Run `annotate_schematic`, then save with `save_project`.
-3. Run `validate_wire_connections` and `validate_component_connections`.
-4. Run `find_shorted_nets`; reconcile each finding against the intended nets.
+3. Run `validate_wire_connections` and `validate_component_connections` — pin-level
+   only (see the caveats above).
+4. Run `export_netlist_summary` and `find_shorted_nets`; reconcile every net against
+   what was intended. This is the net-level check the validators above cannot do,
+   and the only thing that catches a `connect_pins` collision or a same-symbol short.
 5. Run `find_orphan_items` as a heuristic and corroborate its findings.
 6. Run direct KiCad ERC with `run_erc` and classify every violation.
-7. Run `render_schematic_png` with inline output and inspect the actual image.
+7. Run `render_schematic_png` with inline output and inspect the actual image — text
+   overlap, a label crowding a pin, and a wrongly-rotated power symbol are only
+   visible here; no connectivity check sees layout.
 8. Fix findings and repeat every check invalidated by the edits.
 
 ---
@@ -300,7 +358,9 @@ production-ready claim.
 
 1. **Never edit .kicad_sch files directly** — all changes go through MCP tools
 2. **Never guess pin numbers** — always use `get_schematic_pin_locations` or `get_symbol_info` to look up pin numbers before connecting
-3. **Always verify after changes** — run validation tools after placing and wiring
+3. **Always verify after changes** — run validation tools after placing and wiring;
+   they check pins, not nets, so follow up with `export_netlist_summary` /
+   `find_shorted_nets` for net-level correctness
 4. **Use the grid** — all placements on 1.27mm grid
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
 6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels
