@@ -116,7 +116,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
 | `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
-| `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
+| `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. Refuses (writing nothing) if the route would touch a third pin or join two pins of the same symbol. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
 ### `sch_bus` · 4 tools
@@ -169,7 +169,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Preserves every saved hierarchy instance and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
-| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
+| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. All-or-nothing: refuses the whole batch (naming the failing index) if any route would touch a third pin or join two pins of the same symbol. |
 
 ### `sch_export` · 10 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.

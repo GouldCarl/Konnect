@@ -61,6 +61,40 @@ pub enum ToolErrorKind {
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
+    /// `connect_pins`/`batch_connect_pins` would draw a wire whose path
+    /// touches a pin that is not one of its two requested endpoints, or
+    /// whose two requested endpoints are two pins of the same symbol (a
+    /// genuine short even with a single straight segment). Refused before
+    /// anything is written. See BoatDash issues #1 and #14.
+    PinCollision {
+        tool: String,
+        failures: Vec<PinCollisionFailure>,
+    },
+}
+
+/// One refused connection within a `PinCollision` error: the pins that were
+/// requested, and every third-party pin the computed route would have
+/// touched.
+#[derive(Debug, Clone, Serialize)]
+pub struct PinCollisionFailure {
+    /// Position within `batch_connect_pins`' `connections` array. `None` for
+    /// `connect_pins`, which only ever has one connection to name.
+    pub connection_index: Option<usize>,
+    pub ref1: String,
+    pub pin1: String,
+    pub ref2: String,
+    pub pin2: String,
+    pub collisions: Vec<PinCollisionDetail>,
+}
+
+/// A single third-party pin lying on a refused route, or the other
+/// requested pin when both endpoints belong to the same symbol.
+#[derive(Debug, Clone, Serialize)]
+pub struct PinCollisionDetail {
+    pub reference: String,
+    pub pin: String,
+    pub x: f64,
+    pub y: f64,
 }
 
 impl ToolErrorKind {
@@ -77,6 +111,7 @@ impl ToolErrorKind {
             Self::StaleTarget { .. } => "stale_target",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::HandlerError { .. } => "handler_error",
+            Self::PinCollision { .. } => "pin_collision",
         }
     }
 }
@@ -181,6 +216,22 @@ mod tests {
             },
             ToolErrorKind::UnsafeFileFallback { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
+            ToolErrorKind::PinCollision {
+                tool: "connect_pins".into(),
+                failures: vec![PinCollisionFailure {
+                    connection_index: None,
+                    ref1: "R1".into(),
+                    pin1: "1".into(),
+                    ref2: "R2".into(),
+                    pin2: "1".into(),
+                    collisions: vec![PinCollisionDetail {
+                        reference: "R3".into(),
+                        pin: "1".into(),
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                }],
+            },
         ];
         for kind in kinds {
             let code = kind.short_code();
