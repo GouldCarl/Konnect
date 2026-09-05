@@ -81,6 +81,15 @@ winreg = "0.56"
 # SVG parsing (import_svg_logo)
 usvg = "0.48"
 
+# Raw SVG-as-XML reads (check_schematic_layout): kicad-cli's schematic SVG
+# export writes every string a second time as an invisible zero-opacity
+# `<text>` element carrying its exact stroke-font extents (x, y, textLength,
+# font-size, text-anchor, and a `rotate()` wrapper for vertical text). usvg
+# converts text to paths for rendering and does not preserve those attributes,
+# so this reads the SVG as a plain DOM instead. Already in the dependency tree
+# via usvg — pinned to the version already resolved there.
+roxmltree = "0.21"
+
 # Rasterization for the visual-feedback tools (konnect-render). resvg and
 # tiny-skia are pinned EXACTLY: visual baselines compare pixel output across
 # machines, so a silent renderer bump must be a deliberate decision.

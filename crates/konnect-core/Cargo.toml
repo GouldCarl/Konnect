@@ -29,6 +29,7 @@ reqwest.workspace = true
 dirs.workspace = true
 rusqlite.workspace = true
 usvg.workspace = true
+roxmltree.workspace = true
 zip.workspace = true
 tempfile = "3"
 

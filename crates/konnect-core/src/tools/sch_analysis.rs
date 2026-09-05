@@ -21,7 +21,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut defs = vec![
         tool!(
             "list_schematic_wires",
             "List all wire segments in a schematic with start/end coordinates and UUIDs.",
@@ -189,7 +189,9 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic"] }),
             |args, ctx| async move { handle_check_overlaps(args, ctx).await }
         ),
-    ]
+    ];
+    defs.extend(crate::tools::sch_layout::tools());
+    defs
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────

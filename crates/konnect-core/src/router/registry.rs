@@ -44,9 +44,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_analysis",
-        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection",
+        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection, layout lint",
         category: "schematic",
-        tool_count: 15,
+        tool_count: 16,
     },
     ToolsetMeta {
         name: "sch_batch",
