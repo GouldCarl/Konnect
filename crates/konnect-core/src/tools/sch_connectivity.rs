@@ -27,6 +27,13 @@
 //! tolerance, and the tools express policy over it. One [`seed_net_graph`] is
 //! the only definition of the graph, so the ten read-only tools that want net
 //! names cannot drift from the three that ask about attachment.
+//!
+//! One exception to "a single tolerance": whether a junction dot binds a
+//! *pin* sitting mid-wire is checked at [`EXACT_TOLERANCE`], not the caller's.
+//! A pin is a point, not a segment, so there is no rounding-artefact case for
+//! it the way there is for a wire end landing near a sheet pin — a junction
+//! either sits on the pin's own point or it does not, and `kicad-cli` draws
+//! that line far tighter than [`COINCIDENT_TOLERANCE`] ever did.
 
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
@@ -41,6 +48,27 @@ use std::collections::{HashMap, HashSet};
 /// The coincidence tolerance the connectivity tools have always used, in mm.
 /// `find_orphan_items` takes its own as an argument; the rest use this.
 pub(crate) const COINCIDENT_TOLERANCE: f64 = 0.01;
+
+/// How close a junction dot must sit to a pin to bind it, in mm — far tighter
+/// than [`COINCIDENT_TOLERANCE`] or `find_orphan_items`'s default (0.05).
+///
+/// A pin connects to a wire's *interior* only through a junction dot sitting
+/// on that exact point (#104, #13-followup); verified against `kicad-cli sch
+/// export netlist` 10.0.3 with a minimal fixture (two pins on one wire, one at
+/// the true endpoint, one mid-span under a junction): the pin stayed on the
+/// endpoint's net with the junction 5 nm off, and dropped to its own
+/// unconnected net with it 100 nm off. `COINCIDENT_TOLERANCE` (10 000 nm) and
+/// `find_orphan_items`'s default (50 000 nm) are both far past that line, so a
+/// junction dot merely *near* — not exactly at — a mid-wire pin was being
+/// read as binding it, which KiCad's own netlister does not do. This value
+/// sits comfortably under the demonstrated cutoff (and so slightly stricter
+/// than KiCad at the 5 nm end) while still covering same-computation float
+/// reuse, which lands on an exact repeat, not a few nanometres off.
+///
+/// The wider tolerances stay everywhere else in this module on purpose: they
+/// exist to stop a genuine rounding artefact from reading as a *floating*
+/// wire end or sheet pin, not to decide whether a dot actually binds a pin.
+pub(crate) const EXACT_TOLERANCE: f64 = 0.000001;
 
 // ─── Spatial indices ──────────────────────────────────────────────────────────
 
@@ -349,6 +377,10 @@ pub(crate) struct ConnectivityIndex<'a> {
     pin_points: PointIndex,
     sheet_pin_points: PointIndex,
     junction_points: PointIndex,
+    /// Junctions again, at [`EXACT_TOLERANCE`] rather than the caller's
+    /// tolerance — what [`attaches_pin`](Self::attaches_pin) needs, since a
+    /// junction only binds a pin sitting exactly under it.
+    junction_points_exact: PointIndex,
     no_connect_points: PointIndex,
     placed_pins: Vec<PlacedPin>,
 }
@@ -403,7 +435,8 @@ impl<'a> ConnectivityIndex<'a> {
             ),
             pin_points: PointIndex::build(placed_pins.iter().map(|p| p.at), tolerance),
             sheet_pin_points: PointIndex::build(sheet_pins, tolerance),
-            junction_points: PointIndex::build(junctions, tolerance),
+            junction_points: PointIndex::build(junctions.iter().copied(), tolerance),
+            junction_points_exact: PointIndex::build(junctions, EXACT_TOLERANCE),
             no_connect_points: PointIndex::build(extract_no_connects(tree), tolerance),
             placed_pins,
         }
@@ -471,6 +504,12 @@ impl<'a> ConnectivityIndex<'a> {
         self.junction_points.contains(x, y)
     }
 
+    /// Whether a junction dot sits at `(x, y)` to [`EXACT_TOLERANCE`] rather
+    /// than the index's own tolerance — see [`attaches_pin`](Self::attaches_pin).
+    fn has_junction_exact(&self, x: f64, y: f64) -> bool {
+        self.junction_points_exact.contains(x, y)
+    }
+
     pub(crate) fn has_no_connect(&self, x: f64, y: f64) -> bool {
         self.no_connect_points.contains(x, y)
     }
@@ -492,14 +531,19 @@ impl<'a> ConnectivityIndex<'a> {
     /// Whether a pin at `(x, y)` is attached to anything. A wire ending on it,
     /// a label naming it, a hierarchical sheet pin meeting it, or a second pin
     /// stacked on it all connect. A pin landing mid-wire connects only through
-    /// a junction dot: KiCAD's netlister registers the unsplit wire at a
-    /// junction point, so the dot alone is enough (#104).
+    /// a junction dot sitting *exactly* on it (#104, #13-followup): KiCAD's
+    /// netlister registers the unsplit wire at a junction point, but only when
+    /// the dot is that pin's own point, not merely near it — see
+    /// [`EXACT_TOLERANCE`]. A dot the index's ordinary tolerance would call
+    /// coincident but that isn't the same point KiCad parsed back out of the
+    /// file reads as attached here and unconnected in `kicad-cli`'s netlist,
+    /// which is the false negative this tightened check exists to close.
     pub(crate) fn attaches_pin(&self, x: f64, y: f64) -> bool {
         self.has_wire_end(x, y)
             || self.has_label(x, y)
             || self.has_sheet_pin(x, y)
             || self.pins_at(x, y) >= 2
-            || (self.has_junction(x, y) && self.on_wire(x, y))
+            || (self.has_junction_exact(x, y) && self.on_wire(x, y))
     }
 
     /// Every wire endpoint that nothing terminates, as `(x, y, wire uuid)`.
@@ -828,5 +872,141 @@ mod agreement_tests {
 
         let components = call("validate_component_connections", &sch, json!({})).await;
         assert_eq!(components["unconnected_count"], 0, "{components}");
+    }
+
+    // ─── #13: a pin connects only at a wire end (or a junction exactly on it) ──
+    //
+    // Verified against `kicad-cli sch export netlist` 10.0.3 with a two-pin
+    // fixture (one pin at the wire's true endpoint, one mid-span): the
+    // mid-span pin shares the endpoint pin's net with a junction dot sitting
+    // exactly on it, and drops to its own unconnected net with that junction
+    // moved just 100 nm off — far inside `COINCIDENT_TOLERANCE` (10 000 nm)
+    // and `find_orphan_items`'s default (50 000 nm). Konnect's own
+    // `add_wire`/`add_power_symbol` auto-junction insertion always writes the
+    // junction at the pin's own computed float, so it can never itself
+    // produce a near miss — but a hand- or GUI-placed junction a few microns
+    // off (still "coincident" under either tolerance) used to read as
+    // attached here regardless.
+
+    fn wire_a_pin_lies_on(junction_at: Option<f64>) -> String {
+        let junction = junction_at
+            .map(|x| {
+                format!(
+                    "\t(junction\n\t\t(at {x} 80)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"j1\")\n\t)\n"
+                )
+            })
+            .unwrap_or_default();
+        schematic(&format!(
+            "\t(wire\n\t\t(pts (xy 100 80) (xy 120 80))\n\t\t(uuid \"w1\")\n\t)\n{junction}{}",
+            symbol("U1", "u1", 110.0, 80.0),
+        ))
+    }
+
+    /// The base case `attaches_pin` has always gotten right: no junction at
+    /// all, and a pin mid-span on a wire is not attached.
+    #[tokio::test]
+    async fn a_pin_mid_wire_without_a_junction_is_not_attached() {
+        let (tree, wires, labels) = index_for(&wire_a_pin_lies_on(None));
+        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        assert!(!index.attaches_pin(110.0, 80.0));
+    }
+
+    /// A junction dot sitting exactly on the pin attaches it — KiCad's own
+    /// netlister connects this fixture too (see the module comment above).
+    #[tokio::test]
+    async fn a_pin_mid_wire_under_an_exact_junction_is_attached() {
+        let (tree, wires, labels) = index_for(&wire_a_pin_lies_on(Some(110.0)));
+        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        assert!(index.attaches_pin(110.0, 80.0));
+    }
+
+    /// The regression this fix closes: a junction 5 µm off the pin — well
+    /// inside `COINCIDENT_TOLERANCE` (10 µm) and `find_orphan_items`'s
+    /// default (50 µm) — must not attach it, because `kicad-cli` does not
+    /// connect it either (confirmed unconnected at even 100 nm off).
+    #[tokio::test]
+    async fn a_junction_merely_near_a_mid_wire_pin_does_not_attach_it() {
+        let (tree, wires, labels) = index_for(&wire_a_pin_lies_on(Some(110.005)));
+        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        assert!(!index.attaches_pin(110.0, 80.0));
+    }
+
+    /// A wire *end* landing on another wire's interior is a T-junction and
+    /// stays a connection regardless of this fix — that rule belongs to
+    /// `terminates_wire_end`/`on_wire_interior`, untouched here, not to
+    /// `attaches_pin`.
+    #[tokio::test]
+    async fn a_wire_end_on_another_wires_interior_is_connected() {
+        let sch = schematic(
+            "\t(wire\n\t\t(pts (xy 100 80) (xy 120 80))\n\t\t(uuid \"w1\")\n\t)\n\
+             \t(wire\n\t\t(pts (xy 110 80) (xy 110 60))\n\t\t(uuid \"w2\")\n\t)\n\
+             \t(junction\n\t\t(at 110 80)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"j1\")\n\t)\n",
+        );
+        let (tree, wires, labels) = index_for(&sch);
+        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        assert!(!index.terminates_wire_end(110.0, 60.0)); // sanity: the free end is still floating
+        assert!(index.terminates_wire_end(110.0, 80.0));
+    }
+
+    /// Handler-level `find_orphan_items`: a pin under a near-miss junction
+    /// (20 µm off, inside this tool's own 50 µm default) must be reported —
+    /// before this fix it silently passed as attached. (The wire's own two
+    /// ends are also dangling in this minimal fixture — nothing terminates
+    /// them either — so this checks for the pin specifically rather than an
+    /// exact `orphan_count`.)
+    #[tokio::test]
+    async fn find_orphan_items_flags_a_pin_under_a_near_miss_junction() {
+        let sch = wire_a_pin_lies_on(Some(110.02));
+        let orphans = call("find_orphan_items", &sch, json!({})).await;
+        let pin_orphans: Vec<_> = orphans["orphans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["type"] == "unconnected_pin")
+            .collect();
+        assert_eq!(pin_orphans.len(), 1, "{orphans}");
+        assert_eq!(pin_orphans[0]["reference"], "U1");
+    }
+
+    /// Handler-level `get_pin_net_name`: the positive case, matching
+    /// `kicad-cli` — a pin under an exact mid-wire junction takes the wire's
+    /// (labelled) net.
+    #[tokio::test]
+    async fn get_pin_net_name_connects_a_pin_under_an_exact_mid_wire_junction() {
+        let sch = schematic(&format!(
+            "\t(wire\n\t\t(pts (xy 100 80) (xy 120 80))\n\t\t(uuid \"w1\")\n\t)\n\
+             \t(label \"NETA\"\n\t\t(at 100 80 0)\n\t\t(uuid \"l1\")\n\t)\n\
+             \t(junction\n\t\t(at 110 80)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"j1\")\n\t)\n{}",
+            symbol("U1", "u1", 110.0, 80.0),
+        ));
+        let net = call(
+            "get_pin_net_name",
+            &sch,
+            json!({"reference": "U1", "pin_number": "1"}),
+        )
+        .await;
+        assert_eq!(net["net"], "NETA", "{net}");
+    }
+
+    /// Handler-level `get_pin_net_name`: a junction near, not on, the pin
+    /// must not pull it onto the wire's net either. `net_graph_for` already
+    /// got this right before this fix (its union keys are exact `pt_key`s),
+    /// so this locks that half of the shared model in alongside the
+    /// `attaches_pin` fix.
+    #[tokio::test]
+    async fn get_pin_net_name_does_not_pull_in_a_near_miss_junction() {
+        let sch = schematic(&format!(
+            "\t(wire\n\t\t(pts (xy 100 80) (xy 120 80))\n\t\t(uuid \"w1\")\n\t)\n\
+             \t(label \"NETA\"\n\t\t(at 100 80 0)\n\t\t(uuid \"l1\")\n\t)\n\
+             \t(junction\n\t\t(at 110.005 80)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"j1\")\n\t)\n{}",
+            symbol("U1", "u1", 110.0, 80.0),
+        ));
+        let net = call(
+            "get_pin_net_name",
+            &sch,
+            json!({"reference": "U1", "pin_number": "1"}),
+        )
+        .await;
+        assert_eq!(net["net"], serde_json::Value::Null, "{net}");
     }
 }
