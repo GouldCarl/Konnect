@@ -218,7 +218,14 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string" },
                     "power_net": { "type": "string", "description": "Net name (e.g. 'VCC', 'GND')" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "rotation": { "type": "number", "default": 0 }
+                    "rotation": { "type": "number", "default": 0 },
+                    "stub_length_mm": { "type": "number", "default": 0,
+                        "description": "Move the symbol this far from (x, y) along the target \
+                                        pin's outward direction, joined back to (x, y) by a wire \
+                                        stub. Defaults to 0 -- the symbol's own pin lands exactly \
+                                        on (x, y), which is the connection. Set this when a \
+                                        neighbour on the same or an adjacent pin would otherwise \
+                                        overprint this symbol's Value." }
                 },
                 "required": ["schematic", "power_net", "x", "y"]
             }),
@@ -438,7 +445,7 @@ fn find_first_symbol_instance(content: &str) -> Option<usize> {
 
 // ─── Bridge: convert konnect-schematic-editor wires to konnect_sexp wires ──────
 
-fn cse_wires_to_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire> {
+pub(crate) fn cse_wires_to_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire> {
     sch.wires
         .iter()
         .map(|w| konnect_sexp::schematic::Wire {
@@ -456,7 +463,13 @@ fn cse_wires_to_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire>
 /// Pin endpoints that lie strictly inside a wire segment. Each needs a
 /// junction dot: KiCad connects a mid-wire pin only through a junction
 /// (verified with kicad-cli 10 — no wire split required).
-fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<(f64, f64)> {
+pub(crate) fn pins_mid_segment(
+    pins: &[(f64, f64)],
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> Vec<(f64, f64)> {
     let tol = 0.01;
     pins.iter()
         .copied()
@@ -474,7 +487,7 @@ fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> 
 /// wire made, so an unguarded loop re-emits a dot at every existing T on every
 /// call — quadratic in a batch. `insert_wire_with_junctions` guards the same
 /// way on the string path.
-fn add_missing_junctions(sch: &mut cse::Schematic, positions: &[(f64, f64)]) {
+pub(crate) fn add_missing_junctions(sch: &mut cse::Schematic, positions: &[(f64, f64)]) {
     for &(x, y) in positions {
         if !sch
             .junctions
@@ -1586,6 +1599,21 @@ async fn handle_add_power_symbol(
         Err(e) => return Ok(e),
     };
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let stub_length = opt_f64(args, "stub_length_mm").unwrap_or(0.0);
+
+    // Where the symbol's own pin lands is the anchor (x, y): coincidence with
+    // the target pin is the connection (see the tool description). A stub
+    // moves the graphic away from that point along the target pin's outward
+    // direction and joins the two back with a wire, so the symbol's Value no
+    // longer prints on top of the pin it is landing on (#16). Read before any
+    // write touches the file, same as connect_to_net.
+    let (sym_x, sym_y) = if stub_length != 0.0 {
+        let (_, tree) = read_schematic(&sch_path)?;
+        let dir = crate::tools::resolve_stub_direction("auto", (x, y), &tree);
+        (x + dir.dx * stub_length, y + dir.dy * stub_length)
+    } else {
+        (x, y)
+    };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
@@ -1610,7 +1638,7 @@ async fn handle_add_power_symbol(
     let metadata = cse::library::symbol_metadata(&sch, &lib_id);
 
     // Build the Symbol struct
-    let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
+    let mut sym = cse::Symbol::new(format!("power:{}", power_net), sym_x, sym_y);
     sym.at.rotation = Some(rotation);
     sym.unit = 1;
     sym.in_bom = true;
@@ -1627,8 +1655,8 @@ async fn handle_add_power_symbol(
     // suit both (#101).
     let anchors = cse::library::field_anchors(&sch, &lib_id);
     let t = konnect_sexp::geometry::PinTransform {
-        comp_x: x,
-        comp_y: y,
+        comp_x: sym_x,
+        comp_y: sym_y,
         rotation_deg: rotation,
         mirror_x: false,
         mirror_y: false,
@@ -1657,13 +1685,20 @@ async fn handle_add_power_symbol(
         false,
         anchors.value_justify,
     ));
-    sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true, centred));
+    sym.properties.push(positioned(
+        "Footprint",
+        "",
+        sym_x,
+        sym_y,
+        0.0,
+        true,
+        centred,
+    ));
     sym.properties.push(positioned(
         "Datasheet",
         &metadata.datasheet,
-        x,
-        y,
+        sym_x,
+        sym_y,
         0.0,
         true,
         centred,
@@ -1671,8 +1706,8 @@ async fn handle_add_power_symbol(
     sym.properties.push(positioned(
         "Description",
         &metadata.description,
-        x,
-        y,
+        sym_x,
+        sym_y,
         0.0,
         true,
         centred,
@@ -1690,14 +1725,34 @@ async fn handle_add_power_symbol(
         &uuid,
         &context,
         &lib_id,
-        x,
-        y,
+        sym_x,
+        sym_y,
         rotation,
         &pwr_ref,
         Some(&power_net),
         1,
     );
     sch.add_symbol(sym);
+
+    // Stub wire joining the symbol's own pin (sym_x, sym_y) back to the
+    // target pin (x, y) it is connecting to, same T-junction handling as
+    // connect_to_net's stub.
+    if stub_length != 0.0 {
+        let (_, tree) = read_schematic(&sch_path)?;
+        let mut existing_wires = cse_wires_to_sexp(&sch);
+        existing_wires.push(konnect_sexp::schematic::Wire {
+            x1: x,
+            y1: y,
+            x2: sym_x,
+            y2: sym_y,
+            uuid: None,
+        });
+        let junctions = find_t_junctions(&existing_wires, 0.01);
+        sch.add_wire(x, y, sym_x, sym_y);
+        add_missing_junctions(&mut sch, &junctions);
+        let pins = crate::tools::all_pin_endpoints(&tree);
+        add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x, y, sym_x, sym_y));
+    }
     sch.overwrite()?;
 
     // A power pin landing mid-segment on an existing wire needs a junction
@@ -1715,6 +1770,9 @@ async fn handle_add_power_symbol(
         .iter()
         .map(|(x, y)| json!({"x": x, "y": y}))
         .collect::<Vec<_>>());
+    if stub_length != 0.0 {
+        observed["wire"] = json!({ "x1": x, "y1": y, "x2": sym_x, "y2": sym_y });
+    }
 
     Ok(CallToolResult::json(&observed))
 }
@@ -3611,6 +3669,97 @@ mod power_symbol_tests {
             ["#PWR001", "#PWR002", "#PWR003"],
             "the freed number belongs to the new symbol, and nothing may repeat"
         );
+    }
+
+    /// A schematic with one placed pin ("WEST", pointing left) that `x`/`y`
+    /// will target, alongside the `power:GND` library entry `add_power_symbol`
+    /// needs. World endpoint (89.84, 100), same geometry as the
+    /// `connect_to_net_orientation_tests` quad symbol.
+    fn schematic_with_a_west_pin() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("west-pin.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  \
+             (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  \
+             (lib_symbols\n    (symbol \"power:GND\"\n      \
+             (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      \
+             (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n    \
+             (symbol \"Test:CONN\"\n      (symbol \"CONN_1_1\"\n        \
+             (pin passive line (at -10.16 0 0) (length 2.54)\n\
+             \x20         (name \"WEST\") (number \"1\"))\n      )\n    )\n  )\n  \
+             (symbol\n    (lib_id \"Test:CONN\")\n    (at 100 100 0)\n    (unit 1)\n    \
+             (property \"Reference\" \"J1\" (at 100 90 0))\n    \
+             (property \"Value\" \"CONN\" (at 100 110 0))\n    \
+             (instances\n      (project \"west-pin\"\n        \
+             (path \"/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\" (reference \"J1\") (unit 1))\n      )\n    )\n  )\n)\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// `stub_length_mm` moves the power symbol's own pin off the target pin
+    /// (89.84, 100) along that pin's outward ("left") direction, and joins
+    /// the two with a wire — the symbol no longer sits exactly on top of the
+    /// connector pin it is landing on (#16).
+    #[tokio::test]
+    async fn stub_length_mm_moves_the_symbol_off_the_target_pin() {
+        let (_d, path) = schematic_with_a_west_pin();
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 89.84,
+                "y": 100.0,
+                "stub_length_mm": 2.54
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        assert_eq!(sym.at.x, 87.3, "the symbol itself must sit off the pin");
+        assert_eq!(sym.at.y, 100.0);
+        assert_eq!(sch.wires.len(), 1, "a stub wire must join the two points");
+        let wire = &sch.wires[0];
+        assert_eq!(wire.start, (89.84, 100.0));
+        assert_eq!(wire.end, (87.3, 100.0));
+    }
+
+    /// Default (`stub_length_mm` omitted) keeps the pre-existing behaviour:
+    /// the symbol's own pin lands exactly on the requested point, no wire.
+    #[tokio::test]
+    async fn default_stub_length_places_the_symbol_directly_on_the_pin() {
+        let (_d, path) = schematic_with_a_west_pin();
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 89.84,
+                "y": 100.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        assert_eq!(sym.at.x, 89.84);
+        assert_eq!(sym.at.y, 100.0);
+        assert!(sch.wires.is_empty(), "no stub wire by default");
     }
 }
 

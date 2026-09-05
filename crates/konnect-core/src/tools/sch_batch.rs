@@ -8,16 +8,16 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, require_array, require_f64, require_str,
-    ToolDef,
+    all_pin_endpoints, find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, require_array,
+    require_f64, require_str, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{points_coincident, snap_point},
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_label_rotation,
-        read_schematic, symbol_bounds_for_instance, SymbolBounds,
+        find_lib_symbol, find_t_junctions, format_net_label, format_wire, pin_endpoint,
+        pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
 };
@@ -30,7 +30,10 @@ use super::sch_components::{
     commit_component_deletion, indexed_uuid_items, place_one_component, placed_component_readback,
     plan_component_and_item_deletions, ComponentDeleteTargetError,
 };
-use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
+use super::sch_wiring::{
+    add_missing_junctions, cse_wires_to_sexp, pins_mid_segment, resolve_pin_endpoint,
+    resolve_placed_pin, route_between,
+};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -38,8 +41,9 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "batch_connect_to_net",
-            "Connect multiple component pins to a named net by adding net labels at each pin \
-             endpoint. Single file read → all labels inserted → single file write.",
+            "Connect multiple component pins to a named net by adding a short wire stub and a \
+             net label at each pin, same as connect_to_net. Single file read → all stubs and \
+             labels inserted → single file write.",
             json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +60,12 @@ pub fn tools() -> Vec<ToolDef> {
                             },
                             "required": ["reference", "pin_number"]
                         }
-                    }
+                    },
+                    "stub_length_mm": { "type": "number", "default": 2.54,
+                        "description": "Length of the wire stub placed at each pin before its \
+                                        label, same default as connect_to_net's stub_length. \
+                                        Pass 0 to put the label directly on the pin endpoint \
+                                        (the old behaviour)." }
                 },
                 "required": ["schematic", "net_name", "pins"]
             }),
@@ -380,17 +389,24 @@ async fn handle_batch_connect_to_net(
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'pins' array")),
     };
+    // Same default as connect_to_net's `stub_length`; 0 recovers the old
+    // label-on-the-pin behaviour for a caller that wants it.
+    let stub_length = opt_f64(args, "stub_length_mm").unwrap_or(2.54);
 
-    let (content, tree) = read_schematic(&sch_path)?;
+    let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+    // Every placed pin on the sheet, for the mid-segment junction check below.
+    // Fixed for the whole batch: only the new stub wires change.
+    let all_pins = all_pin_endpoints(&tree);
 
-    let mut inserts = String::new();
+    let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut wrote_any = false;
     // Endpoints already carrying this net's label, so a second never lands
     // on the first. Seeded from the file, extended as we go.
     let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
@@ -423,37 +439,69 @@ async fn handle_batch_connect_to_net(
             }
         };
         let (px, py) = pin_endpoint(&pin, t);
-        let rotation = pin_label_rotation(&pin, t);
 
-        // Symbols stack several pins on one endpoint; a label each renders as
-        // a smear. They stay connected by that endpoint.
+        // Same stub-and-rotate logic as connect_to_net (upstream #147 fixed
+        // the rotation half of this; the label still landed on the pin end
+        // with no stub, printing over the pin's own name/number — #16).
+        let outward = pin_outward_direction(&pin, t);
+        let dir = crate::tools::stub_direction("auto", Some(outward));
+        let (label_x, label_y) = (px + dir.dx * stub_length, py + dir.dy * stub_length);
+        let label_rot = dir.label_rotation;
+
+        // Symbols stack several pins on one endpoint, and a re-run must not
+        // stack a second label on the first: both compute the same stub
+        // endpoint, so comparing the label's own point (not the pin's) catches
+        // both — and matches what's actually on disk to compare against.
         let duplicate = labelled
             .iter()
-            .any(|(lx, ly)| points_coincident(*lx, *ly, px, py, 0.01));
-        if !duplicate {
-            inserts.push_str(&format_net_label(&net_name, px, py, rotation));
-            labelled.push((px, py));
+            .any(|(lx, ly)| points_coincident(*lx, *ly, label_x, label_y, 0.01));
+        if duplicate {
+            added.push(json!({
+                "reference": reference,
+                "pin": pin_number,
+                "x": label_x,
+                "y": label_y,
+                "rotation": label_rot,
+                "deduplicated": true
+            }));
+            continue;
         }
-        let mut entry = json!({
+
+        if stub_length != 0.0 {
+            let mut existing_wires = cse_wires_to_sexp(&sch);
+            existing_wires.push(konnect_sexp::schematic::Wire {
+                x1: px,
+                y1: py,
+                x2: label_x,
+                y2: label_y,
+                uuid: None,
+            });
+            let junctions = find_t_junctions(&existing_wires, 0.01);
+            sch.add_wire(px, py, label_x, label_y);
+            add_missing_junctions(&mut sch, &junctions);
+            // Pins the stub passes over mid-segment also need junction dots.
+            add_missing_junctions(
+                &mut sch,
+                &pins_mid_segment(&all_pins, px, py, label_x, label_y),
+            );
+        }
+        sch.add_label(&net_name, label_x, label_y)
+            .set_rotation(label_rot);
+        wrote_any = true;
+        labelled.push((label_x, label_y));
+
+        added.push(json!({
             "reference": reference,
             "pin": pin_number,
-            "x": px,
-            "y": py,
-            "rotation": rotation
-        });
-        if duplicate {
-            entry["deduplicated"] = json!(true);
-        }
-        added.push(entry);
+            "x": label_x,
+            "y": label_y,
+            "rotation": label_rot,
+            "wire": { "x1": px, "y1": py, "x2": label_x, "y2": label_y }
+        }));
     }
 
-    if !inserts.is_empty() {
-        let expected = content.clone();
-        // Labels are element class 2; symbol instances MUST come last, so a
-        // splice at the file's final `)` puts them after the instances and
-        // KiCad refuses the whole file (#156, same bug as add_schematic_text).
-        let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-        write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    if wrote_any {
+        sch.overwrite()?;
     }
 
     Ok(CallToolResult::json(&json!({
@@ -2299,14 +2347,21 @@ mod connect_to_net_orientation_tests {
     }
 
     /// The reported bug: a left-edge pin's label was written at rotation 0,
-    /// so its text ran east across the body, over the pin names.
+    /// so its text ran east across the body, over the pin names. Fixed
+    /// upstream (#147); the label still sits 2.54mm out on a wire stub now
+    /// (#16), same default as connect_to_net, so it also clears the pin's
+    /// own name/number instead of printing on top of them.
     #[tokio::test]
     async fn a_left_edge_pin_gets_a_label_reading_away_from_the_body() {
         let (_d, path) = quad_schematic();
         let after = connect(&path, "SWDIO", "1").await;
         assert_eq!(
             label_of(&after, "SWDIO"),
-            ("89.84 100 180".into(), "right bottom".into())
+            ("87.3 100 180".into(), "right bottom".into())
+        );
+        assert!(
+            after.contains("(xy 89.84 100)") && after.contains("(xy 87.3 100)"),
+            "expected a wire stub from the pin (89.84,100) to the label (87.3,100): {after}"
         );
         assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
         assert!(
@@ -2323,7 +2378,56 @@ mod connect_to_net_orientation_tests {
         let after = connect(&path, "XTAL", "2").await;
         assert_eq!(
             label_of(&after, "XTAL"),
-            ("110.16 100 0".into(), "left bottom".into())
+            ("112.7 100 0".into(), "left bottom".into())
+        );
+    }
+
+    /// `stub_length_mm: 0` recovers the pre-#16 behaviour: the label lands
+    /// directly on the pin endpoint and no wire is added.
+    #[tokio::test]
+    async fn stub_length_mm_zero_puts_the_label_back_on_the_pin() {
+        let (_d, path) = quad_schematic();
+        let result = handle_batch_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_name": "SWDIO",
+                "pins": [{ "reference": "U1", "pin_number": "1" }],
+                "stub_length_mm": 0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            label_of(&after, "SWDIO"),
+            ("89.84 100 180".into(), "right bottom".into())
+        );
+        assert!(!after.contains("(wire"), "no stub wire expected: {after}");
+    }
+
+    /// A custom stub length is honoured, same as connect_to_net's own
+    /// `stub_length` argument.
+    #[tokio::test]
+    async fn stub_length_mm_is_configurable() {
+        let (_d, path) = quad_schematic();
+        let result = handle_batch_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_name": "SWDIO",
+                "pins": [{ "reference": "U1", "pin_number": "1" }],
+                "stub_length_mm": 5.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            label_of(&after, "SWDIO"),
+            ("84.84 100 180".into(), "right bottom".into())
         );
     }
 
@@ -2333,9 +2437,9 @@ mod connect_to_net_orientation_tests {
     async fn vertical_pins_keep_their_label_horizontal() {
         let (_d, path) = quad_schematic();
         let after = connect(&path, "TOP", "3").await;
-        assert_eq!(label_of(&after, "TOP").0, "100 89.84 0");
+        assert_eq!(label_of(&after, "TOP").0, "100 87.3 0");
         let after = connect(&path, "BOTTOM", "4").await;
-        assert_eq!(label_of(&after, "BOTTOM").0, "100 110.16 0");
+        assert_eq!(label_of(&after, "BOTTOM").0, "100 112.7 0");
     }
 
     /// Pins on one endpoint are already connected, so one label serves them
