@@ -403,7 +403,11 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
     }
 }
 
-fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
+fn collect_direct_symbol_geometry(
+    node: &SexpNode,
+    bounds: &mut Option<SymbolBounds>,
+    include_pins: bool,
+) {
     for rectangle in node
         .find_all("rectangle")
         .into_iter()
@@ -443,24 +447,30 @@ fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBou
     for arc in node.find_all("arc") {
         include_arc(bounds, arc);
     }
-    for pin in node.find_all("pin") {
-        let Some(pin) = parse_lib_pin(pin) else {
-            continue;
-        };
-        include_point(bounds, pin.local_x, pin.local_y);
-        let angle = pin.rotation.to_radians();
-        include_point(
-            bounds,
-            pin.local_x + pin.length * angle.cos(),
-            pin.local_y + pin.length * angle.sin(),
-        );
+    if include_pins {
+        for pin in node.find_all("pin") {
+            let Some(pin) = parse_lib_pin(pin) else {
+                continue;
+            };
+            include_point(bounds, pin.local_x, pin.local_y);
+            let angle = pin.rotation.to_radians();
+            include_point(
+                bounds,
+                pin.local_x + pin.length * angle.cos(),
+                pin.local_y + pin.length * angle.sin(),
+            );
+        }
     }
 }
 
-fn collect_symbol_geometry_recursive(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
-    collect_direct_symbol_geometry(node, bounds);
+fn collect_symbol_geometry_recursive(
+    node: &SexpNode,
+    bounds: &mut Option<SymbolBounds>,
+    include_pins: bool,
+) {
+    collect_direct_symbol_geometry(node, bounds, include_pins);
     for child in node.find_all("symbol") {
-        collect_symbol_geometry_recursive(child, bounds);
+        collect_symbol_geometry_recursive(child, bounds, include_pins);
     }
 }
 
@@ -471,15 +481,35 @@ fn collect_symbol_geometry_recursive(node: &SexpNode, bounds: &mut Option<Symbol
 /// common nodes, the requested unit, and un-suffixed nested nodes participate;
 /// other units do not.
 pub fn symbol_local_bounds_for_unit(sym_node: &SexpNode, unit: u32) -> Option<SymbolBounds> {
+    symbol_local_bounds_for_unit_impl(sym_node, unit, true)
+}
+
+/// Same as [`symbol_local_bounds_for_unit`] but graphics only — pin lines are
+/// excluded from the box. `check_schematic_layout` needs the drawn body
+/// separately from the pins: a pin landing inside a *neighbour's* body is a
+/// finding, but a symbol's own pins always touch its own body's silhouette and
+/// would otherwise make every symbol overlap itself.
+pub fn symbol_local_graphics_bounds_for_unit(
+    sym_node: &SexpNode,
+    unit: u32,
+) -> Option<SymbolBounds> {
+    symbol_local_bounds_for_unit_impl(sym_node, unit, false)
+}
+
+fn symbol_local_bounds_for_unit_impl(
+    sym_node: &SexpNode,
+    unit: u32,
+    include_pins: bool,
+) -> Option<SymbolBounds> {
     let mut bounds = None;
-    collect_direct_symbol_geometry(sym_node, &mut bounds);
+    collect_direct_symbol_geometry(sym_node, &mut bounds, include_pins);
     for child in sym_node.find_all("symbol") {
         let child_unit = child
             .get(1)
             .and_then(|node| node.as_str())
             .and_then(parse_subsymbol_unit);
         if !matches!(child_unit, Some(child_unit) if child_unit != 0 && child_unit != unit) {
-            collect_symbol_geometry_recursive(child, &mut bounds);
+            collect_symbol_geometry_recursive(child, &mut bounds, include_pins);
         }
     }
     bounds
@@ -491,7 +521,24 @@ pub fn symbol_bounds_for_instance(
     sym_node: &SexpNode,
     instance: &SymbolInstance,
 ) -> Option<SymbolBounds> {
-    let local = symbol_local_bounds_for_unit(sym_node, instance.unit)?;
+    symbol_bounds_for_instance_impl(sym_node, instance, true)
+}
+
+/// Same as [`symbol_bounds_for_instance`] but graphics only (see
+/// [`symbol_local_graphics_bounds_for_unit`]).
+pub fn symbol_graphics_bounds_for_instance(
+    sym_node: &SexpNode,
+    instance: &SymbolInstance,
+) -> Option<SymbolBounds> {
+    symbol_bounds_for_instance_impl(sym_node, instance, false)
+}
+
+fn symbol_bounds_for_instance_impl(
+    sym_node: &SexpNode,
+    instance: &SymbolInstance,
+    include_pins: bool,
+) -> Option<SymbolBounds> {
+    let local = symbol_local_bounds_for_unit_impl(sym_node, instance.unit, include_pins)?;
     let transform = instance.pin_transform();
     let mut placed = None;
     for (x, y) in [
@@ -841,7 +888,13 @@ fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
     }
 }
 
-fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
+/// Parse one `(pin ...)` node in a library symbol definition, in
+/// symbol-local (Y-up) coordinates. Public so callers needing raw pin
+/// geometry outside a placed instance — e.g. `check_schematic_layout`'s
+/// pin-meets-body-corner check, which compares every unit's pins against
+/// every rectangle in the *unplaced* library definition — do not have to
+/// re-parse `(at)`/`(length)`/`(number)` themselves.
+pub fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
     let (x, y, rotation) = parse_at(node)?;
     let length = node
         .find("length")
