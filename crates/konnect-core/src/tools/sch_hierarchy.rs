@@ -241,6 +241,9 @@ pub fn tools() -> Vec<ToolDef> {
 pub(crate) const MAX_HIERARCHY_DEPTH: usize = 20;
 const ALLOWED_PIN_TYPES: &[&str] = &["input", "output", "bidirectional", "tri_state", "passive"];
 const SHEET_PIN_SPACING_MM: f64 = 2.54;
+/// How close (mm) a pin must sit to a sheet border to count as being on that
+/// edge when picking its text justify.
+const SHEET_PIN_EDGE_TOL_MM: f64 = 0.05;
 const PROJECT_NAME_DESC: &str =
     "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)";
 
@@ -1171,6 +1174,11 @@ async fn handle_import_sheet_pins(
         .expect("looked up above");
     let sheet_uuid = sheet.uuid.clone();
 
+    let edge = if side == "right" {
+        cse::SheetEdge::Right
+    } else {
+        cse::SheetEdge::Left
+    };
     let edge_x = if side == "right" {
         sheet_x + sheet_w
     } else {
@@ -1195,6 +1203,9 @@ async fn handle_import_sheet_pins(
         let y = sheet_y + SHEET_PIN_SPACING_MM * slot as f64;
         let mut pin = cse::SheetPin::new(name.as_str(), pin_type.as_str(), edge_x, y);
         pin.at.rotation = Some(rotation);
+        // Text must read into the box; the justify follows the edge, not the
+        // rotation (Konnect #18).
+        pin.set_pin_justify(edge.pin_justify());
         imported.push(pin.name.clone());
         sheet.add_pin(pin);
     }
@@ -1262,12 +1273,15 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         )));
     }
 
-    sheet.add_pin(cse::SheetPin::new(
-        pin_name.as_str(),
-        pin_type.as_str(),
-        x,
-        y,
-    ));
+    let mut pin = cse::SheetPin::new(pin_name.as_str(), pin_type.as_str(), x, y);
+    // Give the pin the justify its edge demands so its name reads into the box
+    // rather than hanging in the gutter (Konnect #18). The angle is left as
+    // `SheetPin::new` writes it — KiCad derives the pin's side from the angle,
+    // so flipping it to move text would silently move the pin.
+    if let Some(edge) = sheet.edge_at(x, y, SHEET_PIN_EDGE_TOL_MM) {
+        pin.set_pin_justify(edge.pin_justify());
+    }
+    sheet.add_pin(pin);
     let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Add sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
@@ -1307,6 +1321,10 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         }
     };
     let sheet_uuid = sheet.uuid.clone();
+    // Captured before the pin's mutable borrow so a reposition can re-derive the
+    // edge (Konnect #18).
+    let (box_x0, box_y0) = (sheet.at.x, sheet.at.y);
+    let (box_x1, box_y1) = (sheet.at.x + sheet.width, sheet.at.y + sheet.height);
     let pin = match sheet.pin_by_name_mut(&pin_name) {
         Some(p) => p,
         None => {
@@ -1330,6 +1348,13 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         pin.at.x = x;
         pin.at.y = y;
         changed.push("position");
+        // A move can land the pin on a different edge; its justify must follow
+        // so the name still reads into the box.
+        if let Some(edge) =
+            cse::SheetEdge::classify(box_x0, box_y0, box_x1, box_y1, x, y, SHEET_PIN_EDGE_TOL_MM)
+        {
+            pin.set_pin_justify(edge.pin_justify());
+        }
     }
 
     if changed.is_empty() {
@@ -2305,6 +2330,89 @@ mod tests {
         let parent = cse::Schematic::load(&root).unwrap();
         let pin_rotation = parent.sheets.by_name("A").unwrap().pins[0].at.rotation;
         assert_eq!(pin_rotation, Some(0.0));
+    }
+
+    /// Regression for Konnect #18: a sheet pin's text must read *into* the box.
+    /// The justify follows the edge the pin sits on — right edge `right`, left
+    /// edge `left` — so `add_sheet_pin` has to derive it from the position.
+    #[tokio::test]
+    async fn add_sheet_pin_justify_follows_the_edge() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        // Box (20,20)–(100,70) from the default 80×50 sheet.
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+
+        // Right edge x=100.
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power",
+                     "pin_name": "R_PIN", "pin_type": "output", "x": 100.0, "y": 35.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // Left edge x=20.
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power",
+                     "pin_name": "L_PIN", "pin_type": "input", "x": 20.0, "y": 40.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("Power").unwrap();
+        assert_eq!(pin_justify(sheet, "R_PIN").as_deref(), Some("right"));
+        assert_eq!(pin_justify(sheet, "L_PIN").as_deref(), Some("left"));
+    }
+
+    /// Konnect #18 through the primary pin-creation path: imported pins on the
+    /// left edge get `(justify left)`, on the right edge `(justify right)`.
+    #[tokio::test]
+    async fn import_sheet_pins_justify_follows_the_side() {
+        for (side, want) in [("right", "right"), ("left", "left")] {
+            let tmp = TempDir::new().unwrap();
+            let ctx = test_ctx();
+            let root = blank_schematic(tmp.path(), "root.kicad_sch");
+            handle_add_hierarchical_sheet(
+                &json!({ "schematic": root.display().to_string(),
+                         "sheet_file": "power.kicad_sch", "sheet_name": "Power" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            add_label(
+                &tmp.path().join("power.kicad_sch"),
+                "VIN",
+                "input",
+                5.0,
+                5.0,
+            );
+
+            handle_import_sheet_pins(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "Power", "side": side }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            let parent = cse::Schematic::load(&root).unwrap();
+            let sheet = parent.sheets.by_name("Power").unwrap();
+            assert_eq!(
+                pin_justify(sheet, "VIN").as_deref(),
+                Some(want),
+                "side {side} must give justify {want}"
+            );
+        }
+    }
+
+    /// Reading `(justify …)` back out of a sheet pin's effects, for the #18 tests.
+    fn pin_justify(sheet: &cse::Sheet, name: &str) -> Option<String> {
+        let effects = sheet.pin_by_name(name)?.effects.as_ref()?;
+        let rendered = konnect_schematic_editor::sexp::writer::write(&effects.to_sexp());
+        let idx = rendered.find("(justify ")? + "(justify ".len();
+        let rest = &rendered[idx..];
+        let end = rest.find([')', ' '])?;
+        Some(rest[..end].to_string())
     }
 
     #[tokio::test]
