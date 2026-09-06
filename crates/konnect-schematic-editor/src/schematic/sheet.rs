@@ -62,6 +62,14 @@ impl SheetEdge {
     }
 }
 
+fn bool_kw(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 // ---- SheetPin -----------------------------------------------------------------
 
 /// A parent-side connection point on a `(sheet ...)` block. Must be paired with
@@ -123,10 +131,13 @@ impl SheetPin {
             atom(self.pin_type.clone()),
             self.at.to_sexp(),
         ];
+        // KiCAD writes `uuid` before `effects` here — the opposite of most
+        // other elements' `effects`-then-`uuid` — so this used to swap the
+        // two on every save of an untouched sheet pin (#21).
+        c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
-        c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
         SexpNode::List(c)
     }
 
@@ -236,6 +247,16 @@ pub struct Sheet {
     pub width: f64,
     pub height: f64,
     pub uuid: String,
+    /// `(exclude_from_sim …)` / `(in_bom …)` / `(on_board …)` / `(dnp …)` —
+    /// KiCAD 10 added these instance-attribute tokens to hierarchical sheets
+    /// too, written between `size` and `fields_autoplaced`. `None` for older
+    /// files that omit them, so a round-trip doesn't invent the token; left
+    /// unmodelled they swept into the tail of the block with `stroke`/`fill`,
+    /// pushing `fields_autoplaced` ahead of them on every save (#21).
+    pub exclude_from_sim: Option<bool>,
+    pub in_bom: Option<bool>,
+    pub on_board: Option<bool>,
+    pub dnp: Option<bool>,
     pub fields_autoplaced: bool,
     /// `Sheetname` / `Sheetfile` live here alongside any custom sheet properties.
     pub properties: Vec<Property>,
@@ -292,6 +313,10 @@ impl Sheet {
             width,
             height,
             uuid: uuid::Uuid::new_v4().to_string(),
+            exclude_from_sim: None,
+            in_bom: None,
+            on_board: None,
+            dnp: None,
             fields_autoplaced: true,
             properties: vec![sheetname, sheetfile],
             pins: vec![],
@@ -315,6 +340,10 @@ impl Sheet {
             .get(1)
             .and_then(|s| s.parse().ok())
             .ok_or(Error::MissingField("size height"))?;
+        let exclude_from_sim = node.get_bool("exclude_from_sim");
+        let in_bom = node.get_bool("in_bom");
+        let on_board = node.get_bool("on_board");
+        let dnp = node.get_bool("dnp");
         let fields_autoplaced = node.find("fields_autoplaced").is_some();
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
         let properties = node
@@ -339,11 +368,15 @@ impl Sheet {
             .unwrap_or_default();
 
         // Deny-list, matching `Symbol::from_sexp`: anything `to_sexp` does not
-        // rebuild from a typed field — `stroke`, `fill`, and unmodelled tokens
-        // such as `exclude_from_sim` — round-trips verbatim (#143).
+        // rebuild from a typed field — `stroke`, `fill`, and unmodelled tokens —
+        // round-trips verbatim (#143).
         const MODELLED: &[&str] = &[
             "at",
             "size",
+            "exclude_from_sim",
+            "in_bom",
+            "on_board",
+            "dnp",
             "fields_autoplaced",
             "uuid",
             "property",
@@ -357,6 +390,10 @@ impl Sheet {
             width,
             height,
             uuid,
+            exclude_from_sim,
+            in_bom,
+            on_board,
+            dnp,
             fields_autoplaced,
             properties,
             pins,
@@ -372,8 +409,20 @@ impl Sheet {
             "size",
             vec![atom(fmt_f64(self.width)), atom(fmt_f64(self.height))],
         ));
+        if let Some(x) = self.exclude_from_sim {
+            c.push(tagged("exclude_from_sim", vec![atom(bool_kw(x))]));
+        }
+        if let Some(x) = self.in_bom {
+            c.push(tagged("in_bom", vec![atom(bool_kw(x))]));
+        }
+        if let Some(x) = self.on_board {
+            c.push(tagged("on_board", vec![atom(bool_kw(x))]));
+        }
+        if let Some(x) = self.dnp {
+            c.push(tagged("dnp", vec![atom(bool_kw(x))]));
+        }
         if self.fields_autoplaced {
-            c.push(SexpNode::List(vec![atom("fields_autoplaced")]));
+            c.push(tagged("fields_autoplaced", vec![atom("yes")]));
         }
         c.extend(self.raw_sub_nodes.iter().cloned());
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
@@ -603,6 +652,66 @@ mod tests {
 
     fn parse_one(s: &str) -> SexpNode {
         parser::parse(s).unwrap()
+    }
+
+    /// A hierarchical sheet as eeschema writes one (KiCAD 10, format
+    /// 20260306): the instance-attribute tokens between `size` and
+    /// `fields_autoplaced`, `fields_autoplaced` written `yes` (never bare),
+    /// and `stroke`/`fill` after it. All of `exclude_from_sim`/`in_bom`/
+    /// `on_board`/`dnp` used to be unmodelled, which swept them (as one
+    /// preserved-order block) after `fields_autoplaced` instead of before it,
+    /// and the bare `(fields_autoplaced)` form was written regardless of
+    /// what KiCAD itself writes — reordering and reformatting an untouched
+    /// sheet on every save (#21).
+    const KICAD_SHEET: &str = "(sheet\n\t(at 256.54 142.24)\n\t(size 45.72 22.86)\n\t(exclude_from_sim no)\n\t(in_bom yes)\n\t(on_board yes)\n\t(dnp no)\n\t(fields_autoplaced yes)\n\t(stroke (width 0.1524) (type solid))\n\t(fill (color 0 0 0 0))\n\t(uuid \"633d41b4-557c-46cd-911f-a65175e6809e\")\n\t(property \"Sheetname\" \"Power Supply\" (at 256.54 141.5284 0))\n\t(property \"Sheetfile\" \"06-power-48v.kicad_sch\" (at 256.54 165.6746 0))\n)";
+
+    #[test]
+    fn sheet_attribute_tokens_round_trip_in_kicads_order() {
+        let sheet = Sheet::from_sexp(&parse_one(KICAD_SHEET)).unwrap();
+        assert_eq!(sheet.exclude_from_sim, Some(false));
+        assert_eq!(sheet.in_bom, Some(true));
+        assert_eq!(sheet.on_board, Some(true));
+        assert_eq!(sheet.dnp, Some(false));
+        assert!(sheet.fields_autoplaced);
+
+        let out = crate::sexp::writer::write_with_indent(&sheet.to_sexp(), "\t");
+        assert!(
+            out.contains("(fields_autoplaced yes)"),
+            "must write yes, never the bare older form:\n{out}"
+        );
+        let size_pos = out.find("(size").unwrap();
+        let dnp_pos = out.find("(dnp").unwrap();
+        let fields_pos = out.find("(fields_autoplaced").unwrap();
+        let stroke_pos = out.find("(stroke").unwrap();
+        assert!(
+            size_pos < dnp_pos && dnp_pos < fields_pos && fields_pos < stroke_pos,
+            "order must be size, [attributes ending in dnp], fields_autoplaced, stroke:\n{out}"
+        );
+    }
+
+    #[test]
+    fn older_sheet_without_attribute_tokens_stays_absent() {
+        let src = "(sheet (at 0 0) (size 10 10) (uuid \"x\"))";
+        let sheet = Sheet::from_sexp(&parse_one(src)).unwrap();
+        assert_eq!(sheet.exclude_from_sim, None);
+        assert_eq!(sheet.dnp, None);
+        let out = crate::sexp::writer::write(&sheet.to_sexp());
+        assert!(
+            !out.contains("exclude_from_sim"),
+            "must not invent the token:\n{out}"
+        );
+        assert!(!out.contains("dnp"), "must not invent the token:\n{out}");
+    }
+
+    #[test]
+    fn sheet_pin_writes_uuid_before_effects() {
+        // The opposite order from most other elements' effects-then-uuid.
+        let mut pin = SheetPin::new("VIN", "input", 100.0, 60.0);
+        pin.effects = Effects::from_sexp(&parse_one("(effects (font (size 1.27 1.27)))"));
+        let out = crate::sexp::writer::write(&pin.to_sexp());
+        let uuid_pos = out.find("(uuid").unwrap();
+        let effects_pos = out.find("(effects").unwrap();
+        assert!(uuid_pos < effects_pos, "uuid must precede effects:\n{out}");
     }
 
     #[test]
