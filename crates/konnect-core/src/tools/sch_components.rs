@@ -12,7 +12,7 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    commit_command,
+    commit_command, commit_file_transaction,
     geometry::{point_on_segment, points_coincident, snap_point},
     parse_sexp, prepare_command,
     schematic::{
@@ -23,10 +23,11 @@ use konnect_sexp::{
         apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged,
         write_new_atomic, SexpEdit,
     },
-    ItemAnchor, ItemId, SchematicCommand, SexpError,
+    FileTransition, ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -246,11 +247,18 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "annotate_schematic",
-            "Run kicad-cli to auto-assign reference designators (R? → R1, U? → U1, etc.).",
+            "Walk the whole sheet hierarchy from a root schematic and assign sequential \
+             reference designators to every unannotated symbol (R? → R1, U? → U1, etc.), \
+             numbering past the highest existing reference of each prefix anywhere in the \
+             hierarchy so references never collide across sheets. Updates the Reference \
+             property and every hierarchical instance entry together. A symbol whose prefix \
+             cannot be determined (a bare '?' with no resolvable library Reference) is left \
+             unannotated and reported rather than guessed.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string" }
+                    "schematic": { "type": "string", "description": "Root schematic to start from" },
+                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the root schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic"]
             }),
@@ -3159,13 +3167,417 @@ async fn handle_move_region(
     })))
 }
 
+// ─── annotate_schematic ─────────────────────────────────────────────────────
+//
+// kicad-cli 10 has no `sch annotate` command, so annotation is implemented on
+// the parsed schematic model rather than by shelling out. Earlier code did
+// this as a raw string scan for `(reference "` — that token only occurs
+// inside a symbol's `(instances ...)` block, never in the `(property
+// "Reference" ...)` the symbol actually displays and kicad-cli reads, so it
+// renamed instances while leaving the visible reference (and a symbol with
+// no instance block at all) untouched (BoatDash #22).
+
+/// One placed symbol still needing a reference designator.
+struct PendingSymbol {
+    /// Index into `SheetLoad::schematic.symbols`.
+    index: usize,
+    lib_symbol_name: String,
+    unit: u32,
+    old_reference: String,
+}
+
+/// One schematic file visited while walking the hierarchy from the root.
+struct SheetLoad {
+    path: PathBuf,
+    before: String,
+    schematic: cse::Schematic,
+    /// This sheet's own hierarchical instance path (`/root-uuid[/sheet-uuid...]`),
+    /// used only as a fallback when a placed symbol has no instance entries at
+    /// all yet.
+    instance_path: String,
+}
+
+/// Walk the sheet tree from `path` (depth-first, parent before children,
+/// children in file order — matching eeschema's own numbering order), loading
+/// every reachable `.kicad_sch` file once. Missing child files and reference
+/// cycles are skipped rather than failing the whole walk, matching
+/// `get_sheet_hierarchy`.
+fn collect_annotation_sheets(
+    path: &Path,
+    instance_path: &str,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+    sheets: &mut Vec<SheetLoad>,
+) -> anyhow::Result<()> {
+    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
+        return Ok(());
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+
+    let before = read_consistent(path)?;
+    let schematic = cse::Schematic::load(path)?;
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let children: Vec<(PathBuf, String)> = schematic
+        .sheets
+        .iter()
+        .map(|sheet| (dir.join(sheet.file()), sheet.uuid.clone()))
+        .collect();
+
+    sheets.push(SheetLoad {
+        path: path.to_path_buf(),
+        before,
+        schematic,
+        instance_path: instance_path.to_string(),
+    });
+
+    for (child_path, sheet_uuid) in children {
+        if child_path.is_file() {
+            let child_instance_path = format!("{instance_path}/{sheet_uuid}");
+            collect_annotation_sheets(
+                &child_path,
+                &child_instance_path,
+                depth + 1,
+                visited,
+                sheets,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The `lib_symbols` entry's own `Reference` property text (e.g. `"R"` for
+/// `Device:R`), read from the embedded copy so a bare `R?`-less `?` can still
+/// resolve its prefix. `None` when the symbol has no embedded definition or
+/// the definition itself carries no Reference property.
+fn embedded_lib_symbol_reference(
+    schematic: &cse::Schematic,
+    lib_symbol_name: &str,
+) -> Option<String> {
+    let lib_symbol = schematic
+        .raw_other
+        .iter()
+        .find(|node| node.tag() == Some("lib_symbols"))?
+        .find_all("symbol")
+        .into_iter()
+        .find(|node| node.value() == Some(lib_symbol_name))?;
+    lib_symbol
+        .find_all("property")
+        .into_iter()
+        .find(|property| property.value() == Some("Reference"))
+        .and_then(|property| property.args().get(1))
+        .and_then(cse::sexp::SexpNode::text)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// The designator prefix for a group of unannotated symbols sharing
+/// `old_reference`. A non-bare reference (`R?`) yields its own prefix
+/// directly; a bare `?` falls back to the embedded library symbol's own
+/// Reference property (`R?` from `Device:R`'s lib_symbols entry -> `R`).
+/// `None` means the prefix could not be determined and the caller must
+/// refuse rather than guess.
+fn resolve_annotation_prefix(
+    old_reference: &str,
+    lib_symbol_name: &str,
+    schematic: &cse::Schematic,
+) -> Option<String> {
+    let trimmed = old_reference.trim_end_matches('?');
+    if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    let lib_reference = embedded_lib_symbol_reference(schematic, lib_symbol_name)?;
+    let prefix = crate::tools::reference_prefix(&lib_reference);
+    (!prefix.is_empty()).then(|| prefix.to_string())
+}
+
+/// Group a sheet's unannotated-symbol indices so that units of one
+/// multi-unit placement (same embedded lib symbol, same current reference
+/// text, distinct unit numbers) share one new designator, without merging
+/// symbols whose unit numbers collide — that disagreement means they are not
+/// actually the same placement, so each becomes its own group instead of
+/// being folded together (BoatDash #22 fix notes).
+fn group_pending_symbols(pending: &[PendingSymbol]) -> Vec<Vec<usize>> {
+    let mut by_key: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    for (position, symbol) in pending.iter().enumerate() {
+        by_key
+            .entry((symbol.lib_symbol_name.clone(), symbol.old_reference.clone()))
+            .or_default()
+            .push(position);
+    }
+
+    let mut groups = Vec::new();
+    for (_key, positions) in by_key {
+        let mut subgroups: Vec<Vec<usize>> = Vec::new();
+        for position in positions {
+            let unit = pending[position].unit;
+            match subgroups
+                .iter_mut()
+                .find(|group| group.iter().all(|&p| pending[p].unit != unit))
+            {
+                Some(group) => group.push(position),
+                None => subgroups.push(vec![position]),
+            }
+        }
+        groups.extend(subgroups);
+    }
+    groups
+}
+
 async fn handle_annotate_schematic(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    crate::tools::cli::annotate_schematic(&ctx.config.kicad_cli, &sch_path).await?;
-    Ok(CallToolResult::text("Annotation complete."))
+    let root_path = get_path(args, "schematic")?;
+    if !root_path.is_file() {
+        return Ok(CallToolResult::error(format!(
+            "Schematic '{}' not found",
+            root_path.display()
+        )));
+    }
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::tools::project_name_for(&root_path));
+
+    // Root uuid anchors every hierarchical instance path (`/<root-uuid>...`);
+    // real KiCAD files always carry one, but a missing one still leaves the
+    // walk able to proceed against a synthesised identity rather than panic.
+    let root_uuid = {
+        let mut probe = cse::Schematic::load(&root_path)?;
+        crate::tools::ensure_root_uuid(&mut probe)
+    };
+
+    let mut sheets = Vec::new();
+    let mut visited = HashSet::new();
+    collect_annotation_sheets(
+        &root_path,
+        &format!("/{root_uuid}"),
+        0,
+        &mut visited,
+        &mut sheets,
+    )?;
+
+    // Phase 1: count every already-annotated reference across the WHOLE
+    // hierarchy first, so a new number is never handed out where a sheet
+    // visited later already holds it (BoatDash #22 — collisions across
+    // sheets are exactly what left kicad-cli warning "schematic has
+    // annotation errors").
+    let mut counters: HashMap<String, usize> = HashMap::new();
+    for sheet in &sheets {
+        for symbol in sheet.schematic.symbols.iter() {
+            let Some(reference) = symbol.reference().filter(|r| !r.ends_with('?')) else {
+                continue;
+            };
+            let prefix = crate::tools::reference_prefix(reference);
+            if let Ok(number) = reference[prefix.len()..].parse::<usize>() {
+                let counter = counters.entry(prefix.to_string()).or_insert(1);
+                if number >= *counter {
+                    *counter = number + 1;
+                }
+            }
+        }
+    }
+
+    // Phase 2: assign new references, sheet by sheet in the same root-first
+    // order, grouping multi-unit placements within each sheet.
+    let mut annotated: Vec<serde_json::Value> = Vec::new();
+    let mut refused: Vec<serde_json::Value> = Vec::new();
+    let mut transitions: Vec<FileTransition> = Vec::new();
+    let mut readback: Vec<(PathBuf, Vec<String>)> = Vec::new();
+
+    for sheet in &mut sheets {
+        let mut pending: Vec<PendingSymbol> = Vec::new();
+        for (index, symbol) in sheet.schematic.symbols.iter().enumerate() {
+            if let Some(reference) = symbol.reference().filter(|r| r.ends_with('?')) {
+                pending.push(PendingSymbol {
+                    index,
+                    lib_symbol_name: symbol.lib_symbol_name().to_string(),
+                    unit: symbol.unit,
+                    old_reference: reference.to_string(),
+                });
+            }
+        }
+        if pending.is_empty() {
+            continue;
+        }
+
+        let sheet_path_str = sheet.path.display().to_string();
+        let mut changed_ids: Vec<ItemId> = Vec::new();
+        for group in group_pending_symbols(&pending) {
+            let representative = &pending[group[0]];
+            let Some(prefix) = resolve_annotation_prefix(
+                &representative.old_reference,
+                &representative.lib_symbol_name,
+                &sheet.schematic,
+            ) else {
+                for &position in &group {
+                    let symbol = &sheet.schematic.symbols[pending[position].index];
+                    refused.push(json!({
+                        "sheet_path": sheet_path_str,
+                        "uuid": symbol.uuid,
+                        "lib_id": symbol.lib_id,
+                        "reason": "reference has no prefix and the library symbol carries no \
+                                   resolvable Reference property to fall back to"
+                    }));
+                }
+                continue;
+            };
+            let number = {
+                let counter = counters.entry(prefix.clone()).or_insert(1);
+                let n = *counter;
+                *counter += 1;
+                n
+            };
+            let new_reference = format!("{prefix}{number}");
+
+            for &position in &group {
+                let pending_symbol = &pending[position];
+                let old_reference = pending_symbol.old_reference.clone();
+                let symbol_index = pending_symbol.index;
+                let symbol_unit = pending_symbol.unit;
+                let symbol = &mut sheet.schematic.symbols[symbol_index];
+                let uuid = symbol.uuid.clone();
+                let lib_id = symbol.lib_id.clone();
+
+                let existing_instances = symbol.instances();
+                if existing_instances.is_empty() {
+                    symbol.set_instance_path(
+                        &project_name,
+                        &sheet.instance_path,
+                        &new_reference,
+                        symbol_unit,
+                    );
+                } else {
+                    for instance in existing_instances {
+                        if let (Some(instance_project), Some(instance_path)) =
+                            (instance.project, instance.path)
+                        {
+                            let unit = instance.unit.unwrap_or(symbol_unit);
+                            symbol.set_instance_path(
+                                &instance_project,
+                                &instance_path,
+                                &new_reference,
+                                unit,
+                            );
+                        }
+                    }
+                }
+                symbol.set_reference(&new_reference);
+
+                changed_ids.push(ItemId::new(uuid.clone())?);
+                annotated.push(json!({
+                    "sheet_path": sheet_path_str,
+                    "uuid": uuid,
+                    "lib_id": lib_id,
+                    "old_reference": old_reference,
+                    "new_reference": new_reference
+                }));
+            }
+        }
+
+        if changed_ids.is_empty() {
+            continue;
+        }
+        let edited_source = sheet.schematic.to_source();
+        let command = SchematicCommand::replace_items_from_document(
+            &sheet.before,
+            &edited_source,
+            changed_ids.clone(),
+            "Annotate schematic",
+        )?;
+        let (after, _) = prepare_command(&sheet.path, &sheet.before, &command)?;
+        transitions.push(FileTransition::replace(
+            &sheet.path,
+            sheet.before.clone(),
+            after,
+        ));
+        readback.push((
+            sheet.path.clone(),
+            changed_ids
+                .into_iter()
+                .map(|id| id.as_str().to_string())
+                .collect(),
+        ));
+    }
+
+    if !transitions.is_empty() {
+        let journal_dir = root_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        commit_file_transaction(&journal_dir, transitions)?;
+    }
+
+    // Every response field comes from a post-write readback of the changed
+    // files, never from the pre-commit in-memory intent (upstream #387/#394
+    // convention) — a symbol whose write silently didn't stick must not be
+    // reported as annotated.
+    let mut verified_annotated: Vec<serde_json::Value> = Vec::new();
+    for (path, uuids) in &readback {
+        let committed = cse::Schematic::load(path)?;
+        let sheet_path_str = path.display().to_string();
+        for uuid in uuids {
+            let symbol = committed
+                .symbols
+                .iter()
+                .find(|symbol| &symbol.uuid == uuid)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "annotated symbol {uuid} in '{}' missing from post-write readback",
+                        path.display()
+                    )
+                })?;
+            let intent = annotated
+                .iter()
+                .find(|entry| {
+                    entry["uuid"] == json!(uuid) && entry["sheet_path"] == json!(&sheet_path_str)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("internal error: lost annotation intent for {uuid}")
+                })?;
+            verified_annotated.push(json!({
+                "sheet_path": sheet_path_str,
+                "uuid": uuid,
+                "old_reference": intent["old_reference"],
+                "new_reference": symbol.reference().unwrap_or_default()
+            }));
+        }
+    }
+
+    // Remaining unannotated symbols across the whole hierarchy: sheets that
+    // were rewritten are re-read from disk; untouched sheets are still
+    // exactly what's on disk since nothing wrote them.
+    let mut unannotated_remaining_count = 0usize;
+    for sheet in &sheets {
+        let rewritten = readback.iter().any(|(path, _)| path == &sheet.path);
+        let count = if rewritten {
+            cse::Schematic::load(&sheet.path)?
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.reference().is_none_or(|r| r.ends_with('?')))
+                .count()
+        } else {
+            sheet
+                .schematic
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.reference().is_none_or(|r| r.ends_with('?')))
+                .count()
+        };
+        unannotated_remaining_count += count;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "annotated_count": verified_annotated.len(),
+        "unannotated_remaining_count": unannotated_remaining_count,
+        "annotated": verified_annotated,
+        "refused": refused
+    })))
 }
 
 async fn handle_get_schematic_pin_locations(
@@ -7830,5 +8242,339 @@ mod multi_unit_component_tests {
             SexpError::Conflict { .. } | SexpError::ItemConflict { .. }
         ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+}
+
+#[cfg(test)]
+mod annotate_schematic_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        assert!(
+            !result.is_error,
+            "annotate_schematic unexpectedly failed: {result:?}"
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// A single `Device:R` placement, its Reference property carrying
+    /// `reference` and (when `with_instances` is set) an `(instances ...)`
+    /// block whose own embedded reference also carries `reference` — matching
+    /// what `place_one_component` writes for a real placement.
+    fn resistor(uuid: &str, unit: u32, reference: &str, with_instances: bool) -> String {
+        let instances = if with_instances {
+            format!(
+                r#"
+    (instances
+      (project "test"
+        (path "/root-uuid" (reference "{reference}") (unit {unit}))
+      )
+    )"#
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            r#"
+  (symbol
+    (lib_id "Device:R")
+    (at 10 20 0)
+    (unit {unit})
+    (uuid "{uuid}")
+    (property "Reference" "{reference}" (at 10 20 0))
+    (property "Value" "R" (at 10 24 0)){instances}
+  )"#
+        )
+    }
+
+    const R_LIB_SYMBOL: &str = r#"
+  (lib_symbols
+    (symbol "Device:R"
+      (property "Reference" "R" (at 0 0 0))
+      (property "Value" "R" (at 0 0 0))
+    )
+  )"#;
+
+    /// A lib_symbols entry that carries no `Reference` property at all — a
+    /// bare `?` placement of this part has no prefix to fall back to.
+    const NO_REFERENCE_LIB_SYMBOL: &str = r#"
+  (lib_symbols
+    (symbol "Device:Mystery"
+      (property "Value" "Mystery" (at 0 0 0))
+    )
+  )"#;
+
+    fn write_root(dir: &std::path::Path, lib_symbols: &str, symbols: &str) -> std::path::PathBuf {
+        let path = dir.join("root.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                r#"(kicad_sch
+  (version 20260306)
+  (uuid "root-uuid")
+  (generator "test"){lib_symbols}{symbols}
+  (sheet_instances (path "/" (page "1")))
+)
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn reload(path: &std::path::Path) -> cse::Schematic {
+        cse::Schematic::load(path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn annotates_property_and_instances_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_root(dir.path(), R_LIB_SYMBOL, &resistor("r-uuid", 1, "R?", true));
+
+        let response = body(
+            handle_annotate_schematic(&json!({ "schematic": root }), &context())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(response["annotated_count"], json!(1));
+        assert_eq!(response["unannotated_remaining_count"], json!(0));
+
+        let committed = reload(&root);
+        let symbol = committed.symbols.by_reference("R1").expect("R1 placed");
+        assert_eq!(symbol.reference(), Some("R1"));
+        let instances = symbol.instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].reference.as_deref(), Some("R1"));
+        assert_eq!(instances[0].path.as_deref(), Some("/root-uuid"));
+    }
+
+    #[tokio::test]
+    async fn counts_existing_references_across_the_whole_hierarchy() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root already has R3 annotated; a child sheet has a bare-prefix "?"
+        // resistor. The new number must be past the highest reference
+        // anywhere in the hierarchy, not just in the child's own file.
+        let root_symbols = resistor("root-r3-uuid", 1, "R3", true);
+        let root = write_root(dir.path(), R_LIB_SYMBOL, &root_symbols);
+        // Append a sheet block linking to child.kicad_sch.
+        let with_sheet = std::fs::read_to_string(&root).unwrap().replacen(
+            "\n  (sheet_instances",
+            r#"
+  (sheet
+    (at 100 100)
+    (size 20 20)
+    (uuid "sheet-uuid")
+    (property "Sheetname" "Child" (at 100 99 0))
+    (property "Sheetfile" "child.kicad_sch" (at 100 121.635 0))
+  )
+  (sheet_instances"#,
+            1,
+        );
+        std::fs::write(&root, with_sheet).unwrap();
+
+        let child = dir.path().join("child.kicad_sch");
+        std::fs::write(
+            &child,
+            format!(
+                r#"(kicad_sch
+  (version 20260306)
+  (uuid "child-own-uuid")
+  (generator "test"){R_LIB_SYMBOL}{}
+  (sheet_instances (path "/" (page "2")))
+)
+"#,
+                resistor("child-r-uuid", 1, "R?", false)
+            ),
+        )
+        .unwrap();
+
+        let response = body(
+            handle_annotate_schematic(
+                &json!({ "schematic": root, "project_name": "test" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(response["annotated_count"], json!(1));
+
+        let committed_child = reload(&child);
+        let symbol = committed_child
+            .symbols
+            .by_reference("R4")
+            .expect("child resistor numbered past the root's R3");
+        assert_eq!(symbol.reference(), Some("R4"));
+        // The child symbol had no instances block at all — annotate must
+        // create one keyed to this sheet's own hierarchical instance path
+        // rather than leaving the visible property the only place the new
+        // reference is recorded.
+        let instances = symbol.instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].project.as_deref(), Some("test"));
+        assert_eq!(instances[0].path.as_deref(), Some("/root-uuid/sheet-uuid"));
+        assert_eq!(instances[0].reference.as_deref(), Some("R4"));
+
+        // Root had nothing to annotate, so its file must be untouched.
+        let committed_root = reload(&root);
+        assert!(committed_root.symbols.by_reference("R3").is_some());
+    }
+
+    #[tokio::test]
+    async fn bare_question_mark_resolves_prefix_from_the_embedded_lib_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_root(dir.path(), R_LIB_SYMBOL, &resistor("r-uuid", 1, "?", false));
+
+        let response = body(
+            handle_annotate_schematic(&json!({ "schematic": root }), &context())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(response["annotated_count"], json!(1));
+        assert_eq!(
+            response["annotated"][0]["new_reference"],
+            json!("R1"),
+            "bare '?' must resolve its prefix from Device:R's own lib_symbols Reference"
+        );
+
+        let committed = reload(&root);
+        assert_eq!(committed.symbols.as_slice()[0].reference(), Some("R1"));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_bare_question_mark_with_no_resolvable_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let symbol = r#"
+  (symbol
+    (lib_id "Device:Mystery")
+    (at 10 20 0)
+    (unit 1)
+    (uuid "mystery-uuid")
+    (property "Reference" "?" (at 10 20 0))
+    (property "Value" "Mystery" (at 10 24 0))
+  )"#
+        .to_string();
+        let root = write_root(dir.path(), NO_REFERENCE_LIB_SYMBOL, &symbol);
+        let before = std::fs::read_to_string(&root).unwrap();
+
+        let response = body(
+            handle_annotate_schematic(&json!({ "schematic": root }), &context())
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(
+            response["annotated_count"],
+            json!(0),
+            "an unresolvable symbol must never be silently reported as annotated"
+        );
+        assert_eq!(response["unannotated_remaining_count"], json!(1));
+        let refused = response["refused"].as_array().unwrap();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["uuid"], json!("mystery-uuid"));
+        assert_eq!(refused[0]["lib_id"], json!("Device:Mystery"));
+
+        // Nothing to write: the file must be byte-for-byte unchanged.
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn units_of_one_multiunit_placement_share_one_new_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit1 = resistor("unit1-uuid", 1, "U?", false).replace("Device:R", "Device:DUAL");
+        let unit2 = resistor("unit2-uuid", 2, "U?", false).replace("Device:R", "Device:DUAL");
+        let root = write_root(dir.path(), R_LIB_SYMBOL, &format!("{unit1}{unit2}"));
+
+        let response = body(
+            handle_annotate_schematic(&json!({ "schematic": root }), &context())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(response["annotated_count"], json!(2));
+
+        let committed = reload(&root);
+        let refs: Vec<&str> = committed
+            .symbols
+            .iter()
+            .map(|s| s.reference().unwrap())
+            .collect();
+        assert_eq!(
+            refs,
+            vec!["U1", "U1"],
+            "both units of one placement must share the same new designator"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_merge_two_separate_bare_placements_that_collide_on_unit() {
+        // Two ordinary, unrelated resistors both placed with bare "R?" and
+        // unit 1 (the common case) must NOT be folded into one reference —
+        // only genuine multi-unit siblings (distinct unit numbers) share one.
+        let dir = tempfile::tempdir().unwrap();
+        let symbols = format!(
+            "{}{}",
+            resistor("r1-uuid", 1, "R?", false),
+            resistor("r2-uuid", 1, "R?", false)
+        );
+        let root = write_root(dir.path(), R_LIB_SYMBOL, &symbols);
+
+        let response = body(
+            handle_annotate_schematic(&json!({ "schematic": root }), &context())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(response["annotated_count"], json!(2));
+
+        let committed = reload(&root);
+        let mut refs: Vec<&str> = committed
+            .symbols
+            .iter()
+            .map(|s| s.reference().unwrap())
+            .collect();
+        refs.sort_unstable();
+        assert_eq!(
+            refs,
+            vec!["R1", "R2"],
+            "unit-colliding placements must get distinct designators, not be merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_counts_are_derived_from_post_write_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_root(dir.path(), R_LIB_SYMBOL, &resistor("r-uuid", 1, "R?", true));
+
+        let response = body(
+            handle_annotate_schematic(&json!({ "schematic": root }), &context())
+                .await
+                .unwrap(),
+        );
+
+        let annotated = response["annotated"].as_array().unwrap();
+        assert_eq!(response["annotated_count"], json!(annotated.len()));
+        // The reported new_reference must equal what is actually on disk, not
+        // merely the pre-commit intent.
+        let committed = reload(&root);
+        let on_disk = committed.symbols.as_slice()[0].reference().unwrap();
+        assert_eq!(annotated[0]["new_reference"], json!(on_disk));
     }
 }
