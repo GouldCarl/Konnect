@@ -1,0 +1,298 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "8a1d3bbf-65fe-4cc0-9d9e-4ec47d238186")
+	(paper "A4")
+	(lib_symbols
+		(symbol "Device:R"
+			(pin_numbers
+				(hide yes)
+			)
+			(pin_names
+				(offset 0)
+			)
+			(exclude_from_sim no)
+			(in_bom yes)
+			(on_board yes)
+			(in_pos_files yes)
+			(duplicate_pin_numbers_are_jumpers no)
+			(property "Reference" "R"
+				(at 2.032 0 90)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Value" "R"
+				(at 0 0 90)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Footprint" ""
+				(at -1.778 0 90)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Datasheet" ""
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(symbol "R_0_1"
+				(rectangle
+					(start -1.016 -2.54)
+					(end 1.016 2.54)
+					(stroke
+						(width 0.254)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+			)
+			(symbol "R_1_1"
+				(pin passive line
+					(at 0 3.81 270)
+					(length 1.27)
+					(name ""
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin passive line
+					(at 0 -3.81 90)
+					(length 1.27)
+					(name ""
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "2"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+			)
+		)
+	)
+	(wire
+		(pts
+			(xy 90 50) (xy 110 50)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "b0000000-0000-4000-8000-000000000001")
+	)
+	(label "SIG"
+		(at 103 46.19 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "b0000000-0000-4000-8000-000000000002")
+	)
+	(label "AUX"
+		(at 250 150 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "b0000000-0000-4000-8000-000000000003")
+	)
+	(label "AUX"
+		(at 250.1 150 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "b0000000-0000-4000-8000-000000000004")
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 100 50 0)
+		(unit 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(uuid "c0000000-0000-4000-8000-000000000001")
+		(property "Reference" "R1"
+			(at 103 46.19 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "10k"
+			(at 103 53.81 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1" (uuid "d0000000-0000-4000-8000-000000000001"))
+		(pin "2" (uuid "d0000000-0000-4000-8000-000000000002"))
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 150 50 0)
+		(unit 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(uuid "c0000000-0000-4000-8000-000000000002")
+		(property "Reference" "R2"
+			(at 153 46.19 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "1k"
+			(at 160 60 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1" (uuid "d0000000-0000-4000-8000-000000000003"))
+		(pin "2" (uuid "d0000000-0000-4000-8000-000000000004"))
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 3 3 0)
+		(unit 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(uuid "c0000000-0000-4000-8000-000000000003")
+		(property "Reference" "R3"
+			(at 6 0 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "3k3"
+			(at 6 6 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1" (uuid "d0000000-0000-4000-8000-000000000005"))
+		(pin "2" (uuid "d0000000-0000-4000-8000-000000000006"))
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 200 100 0)
+		(unit 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(uuid "c0000000-0000-4000-8000-000000000004")
+		(property "Reference" "R4"
+			(at 203 96.19 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "4k"
+			(at 203 103.81 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1" (uuid "d0000000-0000-4000-8000-000000000007"))
+		(pin "2" (uuid "d0000000-0000-4000-8000-000000000008"))
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 203 100 0)
+		(unit 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(uuid "c0000000-0000-4000-8000-000000000005")
+		(property "Reference" "R5"
+			(at 206 96.19 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "5k"
+			(at 206 103.81 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1" (uuid "d0000000-0000-4000-8000-000000000009"))
+		(pin "2" (uuid "d0000000-0000-4000-8000-000000000010"))
+	)
+	(sheet_instances
+		(path "/" (page "1"))
+	)
+)
