@@ -82,7 +82,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
-| `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
+| `annotate_schematic` | Walk the whole sheet hierarchy from a root schematic and assign sequential reference designators to every unannotated symbol (`R?` → `R1`, `U?` → `U1`, etc.), numbering past the highest existing reference of each prefix anywhere in the hierarchy. Updates the Reference property and every hierarchical instance entry together; a symbol whose prefix can't be determined is left unannotated and reported. |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. |

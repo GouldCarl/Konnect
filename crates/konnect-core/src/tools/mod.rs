@@ -497,6 +497,14 @@ pub fn get_path(args: &Value, key: &str) -> anyhow::Result<std::path::PathBuf> {
 /// Project name used in symbol/sheet `(instances (project "..." ...))` entries:
 /// the schematic's file stem, matching what eeschema writes when it saves a
 /// standalone root sheet.
+/// The designator prefix of a reference: everything before its trailing
+/// digits, or before a bare `?` on an unannotated symbol (`R1` -> `R`, `R?` ->
+/// `R`, `#PWR12` -> `#PWR`). Shared by instance-path validation and
+/// annotation so both agree on where one designator's number starts.
+pub(crate) fn reference_prefix(reference: &str) -> &str {
+    reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
+}
+
 pub fn project_name_for(sch_path: &std::path::Path) -> String {
     sch_path
         .file_stem()
@@ -1665,10 +1673,6 @@ pub(crate) fn validate_sheet_instance_state(
         .map(|path| (context.project_name.clone(), path.clone()))
         .collect::<Vec<_>>();
     expected.sort();
-
-    fn reference_prefix(reference: &str) -> &str {
-        reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
-    }
 
     let mut stale_symbols = Vec::new();
     for symbol in &schematic.symbols {
