@@ -70,11 +70,11 @@
 
 | Scenario | Tool | Why |
 |----------|------|-----|
-| Two specific pins on two components | `connect_pins` | Auto-routes, knows pin coordinates |
+| Two specific pins on two components | `connect_to_net` (shared net name), or `connect_pins` only after checking the route is clear | `connect_pins` auto-routes but never checks what the route crosses — see the `kicad-schematic` skill's warning before using it |
 | Pin to a named net (signal bus) | `connect_to_net` | Adds stub + label, clean |
 | Pin to power rail | `add_power_symbol` | Creates net automatically |
-| Multiple pins to same net | `batch_connect_to_net` | Single atomic write |
-| Two points already known by coordinates | `add_schematic_connection` | Auto H+V routing |
+| Multiple pins to same net | `batch_connect_to_net` | Single atomic write, but no stub — crowds tight-pitch pins |
+| Two points already known by coordinates | `add_schematic_connection` | Auto H+V routing, same unchecked-route caveat as `connect_pins` |
 | Simple horizontal/vertical wire | `add_wire` | Manual, use sparingly |
 
 ## Net Label Types
@@ -90,5 +90,7 @@
 
 - Components: minimum 5.08mm (4 grid units) between component bodies
 - Labels: place at wire endpoints, not floating in space
-- Power symbols: directly on component power pins when possible
+- Power symbols: on the pin when it has room; on pins closer than ~5mm apart,
+  stub 2.54mm out along the pin's outward direction instead so Value text does
+  not overprint the neighbour (see `add_power_symbol` in the `kicad-schematic` skill)
 - Junctions: added automatically by Konnect at T-intersections

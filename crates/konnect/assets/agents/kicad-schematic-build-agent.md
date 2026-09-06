@@ -49,18 +49,23 @@ load_toolset("templates")
 
 **Step 4: Wire the Circuit**
 - Use `connect_to_net` for power connections (cleaner than explicit wires)
-- Use `connect_pins` for direct point-to-point signals
+- Use `connect_pins` for direct point-to-point signals only after confirming no
+  third pin's coordinate falls on the drawn path (see the `kicad-schematic` skill's
+  warning); prefer `connect_to_net` otherwise
 - Use net labels for signals that span groups or sheets
 - Wire power first, then signals, then low-priority connections
 
-**Step 5: Annotate and save**
+**Step 5: Annotate**
 - Run `annotate_schematic` for sequential reference designators
 - Verify no duplicate references
-- Run `save_project` so formal checks inspect the current saved design
+- No save step: every schematic tool has already written its change to disk
+  (`save_project` is the PCB save over IPC and fails without a running KiCad)
 
 **Step 6: Collect direct evidence**
-- Run `validate_wire_connections` and `validate_component_connections`
-- Run `find_shorted_nets`; reconcile every result against intended connectivity
+- Run `validate_wire_connections` and `validate_component_connections` — pin-level
+  only, they do not check which net a pin ends up on
+- Run `export_netlist_summary` and `find_shorted_nets`; reconcile every result
+  against intended connectivity
 - Run `run_erc`; classify every violation and preserve any explicit waiver
 - Run `render_schematic_png` with inline output and inspect the image
 - Confirm functional blocks are visually grouped, labels and symbols do not

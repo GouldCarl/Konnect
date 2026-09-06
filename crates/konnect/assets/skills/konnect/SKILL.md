@@ -40,7 +40,8 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 
 1. **Identify the project** — locate the `.kicad_pro` file
 2. **Classify the task** — read-only (Channel 2 or 3) or write (Channel 1)
-3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available
+3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available, and
+   `get_installation_info` once to record which build, binary and KiCad CLI are serving the session
 4. **Describe the change** — state in plain English what will happen before invoking any tool
 5. **Execute** — use Konnect MCP tools only
 6. **Verify** — re-query the design to confirm the change landed correctly
