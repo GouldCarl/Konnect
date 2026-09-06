@@ -55,10 +55,11 @@ load_toolset("templates")
 - Use net labels for signals that span groups or sheets
 - Wire power first, then signals, then low-priority connections
 
-**Step 5: Annotate and save**
+**Step 5: Annotate**
 - Run `annotate_schematic` for sequential reference designators
 - Verify no duplicate references
-- Run `save_project` so formal checks inspect the current saved design
+- No save step: every schematic tool has already written its change to disk
+  (`save_project` is the PCB save over IPC and fails without a running KiCad)
 
 **Step 6: Collect direct evidence**
 - Run `validate_wire_connections` and `validate_component_connections` — pin-level

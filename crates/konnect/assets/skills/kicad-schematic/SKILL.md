@@ -21,16 +21,19 @@ Before any schematic work, load the required toolsets:
 ```
 load_toolset('sch_components')   # place, move, rotate, delete symbols
 load_toolset('sch_wiring')       # wires, net labels, power symbols, connections
-load_toolset('sch_analysis')     # connection validation, short and orphan checks
-load_toolset('sch_export')       # direct ERC and rendered schematic evidence
-load_toolset('project')          # save_project before formal checks
+load_toolset('sch_analysis')     # find_shorted_nets, find_orphan_items
+load_toolset('sch_batch')        # batch_* tools, validate_wire_connections, validate_component_connections
+load_toolset('sch_export')       # export_netlist_summary, direct ERC and rendered schematic evidence
 ```
+
+Schematic tools write the `.kicad_sch` atomically on every call — there is no separate save
+step. `save_project` (toolset `project`) saves a PCB open in a running KiCad over IPC and fails
+when KiCad is not running; do not call it for schematic work.
 
 Load additional toolsets as needed:
 
 ```
 load_toolset('library')          # search_symbols, get_symbol_info, list_symbol_libraries
-load_toolset('sch_batch')        # batch operations for 3+ items
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -96,7 +99,11 @@ the order pins appear on screen.
 - 270 degrees: rotated CW
 
 Power symbols connect by coincidence, not orientation, but the wrong rotation draws
-the arrow back across the part it powers. The arrow always extends the *same*
+the arrow back across the part it powers. Coincidence joins the symbol's pin to whatever
+is at that point; it does not name the net unless the symbol is a named rail (`GND`,
+`+3V3`, …). A `PWR_FLAG` has no net name, so a flag dropped on an otherwise bare pin
+makes a two-node net of the pin and the flag — wire the pin to its real net first, then
+put the flag on that wire. The arrow always extends the *same*
 direction the target pin already points — call `get_schematic_pin_locations` for its
 `orientation_degrees` and look it up:
 
@@ -132,7 +139,8 @@ pattern.
 
 | Scenario                                | Method                  | Why                                      |
 |-----------------------------------------|-------------------------|------------------------------------------|
-| Two pins physically close (<30mm)       | `connect_to_net` (shared net name) | Stub wire + net label, no route to check |
+| Adjacent parts in the same block (a cap on a pin, a divider) | `add_wire` segments that end exactly on both pins | Reads as a circuit; a sheet made only of labelled stubs is a netlist, not a schematic |
+| Two pins close but not adjacent (<30mm) | `connect_to_net` (shared net name) | Stub wire + net label, no route to check |
 | Named signal (SDA, MOSI, EN, etc.)      | `connect_to_net`        | Stub wire + net label, cleaner           |
 | Power rail (VCC, GND, +3V3)             | `add_power_symbol`      | Proper power symbol, global net          |
 | Bus signals (D0-D7)                     | `connect_to_net`        | Net labels with bus naming               |
@@ -304,9 +312,10 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 ### Verification Workflow
 
 1. Place and wire complete functional blocks.
-2. Run `annotate_schematic`, then save with `save_project`.
-3. Run `validate_wire_connections` and `validate_component_connections` — pin-level
-   only (see the caveats above).
+2. Run `annotate_schematic` (every schematic tool has already written its change to disk;
+   there is no save step).
+3. Run `validate_wire_connections` and `validate_component_connections` (toolset
+   `sch_batch`) — pin-level only (see the caveats above).
 4. Run `export_netlist_summary` and `find_shorted_nets`; reconcile every net against
    what was intended. This is the net-level check the validators above cannot do,
    and the only thing that catches a `connect_pins` collision or a same-symbol short.
@@ -365,6 +374,6 @@ production-ready claim.
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
 6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels
 7. **Net labels for named signals** — keeps schematics readable
-8. **Save frequently** — call `save_project` after major operations
+8. **No save step for schematics** — every mutating schematic tool writes the file atomically; `save_project` is the PCB save over IPC and fails without a running KiCad
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting
 10. **Batch for bulk** — use batch toolset for 3+ repetitive operations
