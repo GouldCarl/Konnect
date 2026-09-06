@@ -59,9 +59,10 @@ load_toolset("templates")
 - Use net labels for signals that span groups or sheets
 - Wire power first, then signals, then low-priority connections
 
-**Step 5: Annotate and save**
-- Run `annotate_schematic`; an `outcome` of `partial` means `unresolved` names duplicated or unprovable designators — resolve them (`resolve_duplicates: true` for separate parts, or edit the designators; units of one multi-unit package are never renumbered for you) before saving
-- Run `save_project` so formal checks inspect the current saved design
+**Step 5: Annotate**
+- Run `annotate_schematic`; an `outcome` of `partial` means `unresolved` names duplicated or unprovable designators — resolve them (`resolve_duplicates: true` for separate parts, or edit the designators; units of one multi-unit package are never renumbered for you)
+- No save step: every schematic tool has already written its change to disk
+  (`save_project` is the PCB save over IPC and fails without a running KiCad)
 
 **Step 6: Collect direct evidence**
 - Run `validate_wire_connections` and `validate_component_connections` — pin-level
