@@ -95,6 +95,10 @@ pub struct Schematic {
     /// come back as a whole-file reindent (#210). KiCAD writes tabs; this
     /// crate used to emit two spaces unconditionally.
     indent: String,
+    /// The line ending the loaded file used (`\n` or `\r\n`), so a save does
+    /// not turn a CRLF file into an LF one (#21). This crate's own buffer is
+    /// always built with `\n` and converted on write.
+    line_ending: String,
 
     pub version: Option<u32>,
     pub generator: Option<String>,
@@ -142,7 +146,8 @@ impl Schematic {
     /// Saving to the loaded path instead performs a revision-checked commit.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let text = writer::write_with_indent(&self.to_sexp(), &self.indent);
+        let text =
+            writer::write_with_indent_and_eol(&self.to_sexp(), &self.indent, &self.line_ending);
         if path == self.filepath {
             let mut original_source = self.original_source.lock().map_err(|_| {
                 crate::error::Error::Io(std::io::Error::other(
@@ -168,7 +173,7 @@ impl Schematic {
     /// commands from an edited candidate and commit through `konnect-sexp`.
     #[must_use]
     pub fn to_source(&self) -> String {
-        writer::write_with_indent(&self.to_sexp(), &self.indent)
+        writer::write_with_indent_and_eol(&self.to_sexp(), &self.indent, &self.line_ending)
     }
 
     pub fn filepath(&self) -> &Path {
@@ -481,6 +486,7 @@ impl Schematic {
         Ok(Schematic {
             filepath,
             indent: crate::sexp::writer::detect_indent(&original_source),
+            line_ending: crate::sexp::writer::detect_line_ending(&original_source).to_string(),
             original_source: Mutex::new(original_source),
             version,
             generator,
@@ -532,9 +538,13 @@ impl Schematic {
         }
 
         // Preserved nodes — emit in order:
-        // lib_symbols and title_block go early; sheet_instances/symbol_instances go late
+        // lib_symbols and title_block go early; sheet_instances/symbol_instances
+        // go late; embedded_fonts is the true last node KiCAD 10 writes — it
+        // used to land in the "remaining" bucket ahead of sheet_instances,
+        // reordering the file's last two nodes on every save (#21).
         let early_tags = ["lib_symbols", "title_block", "lib_text_vars"];
         let late_tags = ["sheet_instances", "symbol_instances"];
+        let final_tags = ["embedded_fonts"];
 
         // Early raw_other nodes
         for node in &self.raw_other {
@@ -544,8 +554,16 @@ impl Schematic {
             }
         }
 
-        // Typed elements in KiCAD 10 required order:
-        // junctions → no_connects → wires → texts → labels → sheets → symbols (LAST)
+        // Typed elements, in the order eeschema itself writes them (verified
+        // against real KiCAD 10 saves, not guessed): texts → junctions →
+        // no_connects → wires → labels → symbols → sheets. The free-floating
+        // `(text …)` block used to be emitted after wires, and sheets before
+        // symbols — both wrong, so an untouched sheet's `(text …)` and every
+        // `(sheet …)` block moved to a different place in the file on every
+        // save even when nothing about them changed (#21).
+        for t in &self.texts {
+            c.push(t.to_sexp());
+        }
         for j in &self.junctions {
             c.push(j.to_sexp());
         }
@@ -554,9 +572,6 @@ impl Schematic {
         }
         for w in self.wires.iter() {
             c.push(w.to_sexp());
-        }
-        for t in &self.texts {
-            c.push(t.to_sexp());
         }
         for l in self.labels.iter() {
             c.push(l.to_sexp());
@@ -567,17 +582,18 @@ impl Schematic {
         for h in self.hierarchical_labels.iter() {
             c.push(h.to_sexp());
         }
+        for s in self.symbols.iter() {
+            c.push(s.to_sexp());
+        }
         for s in self.sheets.iter() {
             c.push(s.to_sexp());
         }
-        for s in self.symbols.iter() {
-            c.push(s.to_sexp());
-        } // ALWAYS LAST
 
-        // Remaining raw_other nodes (sheet_instances, etc.)
+        // Remaining raw_other nodes (unknown tokens, if any).
         for node in &self.raw_other {
             let tag = node.tag().unwrap_or("");
-            if !early_tags.contains(&tag) && !late_tags.contains(&tag) {
+            if !early_tags.contains(&tag) && !late_tags.contains(&tag) && !final_tags.contains(&tag)
+            {
                 // Unknown nodes — emit after typed elements but before late nodes
                 c.push(node.clone());
             }
@@ -585,6 +601,12 @@ impl Schematic {
         for node in &self.raw_other {
             let tag = node.tag().unwrap_or("");
             if late_tags.contains(&tag) {
+                c.push(node.clone());
+            }
+        }
+        for node in &self.raw_other {
+            let tag = node.tag().unwrap_or("");
+            if final_tags.contains(&tag) {
                 c.push(node.clone());
             }
         }

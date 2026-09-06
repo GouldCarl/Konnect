@@ -36,11 +36,21 @@ pub struct Symbol {
     pub at: At,
     pub mirror: Option<String>,
     pub unit: u32,
+    /// `(body_style …)` — which DeMorgan alternate the placed unit shows.
+    /// `None` for older files that omit it, so a round-trip doesn't invent
+    /// the token. KiCAD 10 writes this immediately after `unit`; leaving it
+    /// unmodelled swept it into the tail of the block with `pin`/`instances`
+    /// on every save, reordering every placed symbol for no reason (#21).
+    pub body_style: Option<u32>,
     /// `(exclude_from_sim …)`, present in KiCAD 8+ files. `None` for older
     /// files that omit it, so a round-trip doesn't invent the token.
     pub exclude_from_sim: Option<bool>,
     pub in_bom: bool,
     pub on_board: bool,
+    /// `(in_pos_files …)`. `None` for older files that omit it. KiCAD 10
+    /// writes this between `on_board` and `dnp`; same reordering hazard as
+    /// `body_style` above (#21).
+    pub in_pos_files: Option<bool>,
     pub dnp: bool,
     pub fields_autoplaced: bool,
     pub uuid: String,
@@ -60,9 +70,11 @@ impl Symbol {
             at: At::new(x, y),
             mirror: None,
             unit: 1,
+            body_style: None,
             exclude_from_sim: None,
             in_bom: true,
             on_board: true,
+            in_pos_files: None,
             dnp: false,
             fields_autoplaced: false,
             uuid: uuid::Uuid::new_v4().to_string(),
@@ -91,9 +103,11 @@ impl Symbol {
             .get_value("unit")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
+        let body_style = node.get_value("body_style").and_then(|s| s.parse().ok());
         let exclude_from_sim = node.get_bool("exclude_from_sim");
         let in_bom = node.get_bool("in_bom").unwrap_or(true);
         let on_board = node.get_bool("on_board").unwrap_or(true);
+        let in_pos_files = node.get_bool("in_pos_files");
         let dnp = node.get_bool("dnp").unwrap_or(false);
         let fields_autoplaced = node.find("fields_autoplaced").is_some();
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
@@ -114,9 +128,11 @@ impl Symbol {
             "at",
             "mirror",
             "unit",
+            "body_style",
             "exclude_from_sim",
             "in_bom",
             "on_board",
+            "in_pos_files",
             "dnp",
             "fields_autoplaced",
             "uuid",
@@ -130,9 +146,11 @@ impl Symbol {
             at,
             mirror,
             unit,
+            body_style,
             exclude_from_sim,
             in_bom,
             on_board,
+            in_pos_files,
             dnp,
             fields_autoplaced,
             uuid,
@@ -161,14 +179,20 @@ impl Symbol {
             c.push(tagged("mirror", vec![atom(m.clone())]));
         }
         c.push(tagged("unit", vec![atom(self.unit.to_string())]));
+        if let Some(bs) = self.body_style {
+            c.push(tagged("body_style", vec![atom(bs.to_string())]));
+        }
         if let Some(x) = self.exclude_from_sim {
             c.push(tagged("exclude_from_sim", vec![atom(bool_kw(x))]));
         }
         c.push(tagged("in_bom", vec![atom(bool_kw(self.in_bom))]));
         c.push(tagged("on_board", vec![atom(bool_kw(self.on_board))]));
+        if let Some(x) = self.in_pos_files {
+            c.push(tagged("in_pos_files", vec![atom(bool_kw(x))]));
+        }
         c.push(tagged("dnp", vec![atom(bool_kw(self.dnp))]));
         if self.fields_autoplaced {
-            c.push(SexpNode::List(vec![atom("fields_autoplaced")]));
+            c.push(tagged("fields_autoplaced", vec![atom("yes")]));
         }
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
         for p in &self.properties {
@@ -554,6 +578,64 @@ fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A placed symbol as eeschema itself writes one (KiCAD 10, format
+    /// 20260306): `body_style` right after `unit`, `in_pos_files` between
+    /// `on_board` and `dnp`. Both used to be unmodelled, which swept them to
+    /// the tail of the block — after every `property` — reordering an
+    /// untouched symbol on every save (#21).
+    const PLACED_SYMBOL: &str = "(symbol\n\t(lib_id \"power:PWR_FLAG\")\n\t(at 93.98 189.23 90)\n\t(unit 1)\n\t(body_style 1)\n\t(exclude_from_sim no)\n\t(in_bom yes)\n\t(on_board yes)\n\t(in_pos_files yes)\n\t(dnp no)\n\t(uuid \"081a27a0-1d34-4aa2-80ba-a900a0e54f68\")\n)";
+
+    #[test]
+    fn body_style_and_in_pos_files_round_trip_in_kicads_order() {
+        let sym = Symbol::from_sexp(&crate::sexp::parser::parse(PLACED_SYMBOL).unwrap()).unwrap();
+        assert_eq!(sym.body_style, Some(1));
+        assert_eq!(sym.in_pos_files, Some(true));
+
+        let out = crate::sexp::writer::write_with_indent(&sym.to_sexp(), "\t");
+        let unit_pos = out.find("(unit 1)").unwrap();
+        let body_style_pos = out.find("(body_style 1)").unwrap();
+        let exclude_pos = out.find("(exclude_from_sim").unwrap();
+        let on_board_pos = out.find("(on_board").unwrap();
+        let in_pos_files_pos = out.find("(in_pos_files").unwrap();
+        let dnp_pos = out.find("(dnp").unwrap();
+        assert!(
+            unit_pos < body_style_pos && body_style_pos < exclude_pos,
+            "body_style must sit between unit and exclude_from_sim:\n{out}"
+        );
+        assert!(
+            on_board_pos < in_pos_files_pos && in_pos_files_pos < dnp_pos,
+            "in_pos_files must sit between on_board and dnp:\n{out}"
+        );
+    }
+
+    #[test]
+    fn older_symbol_without_body_style_or_in_pos_files_stays_absent() {
+        let src = "(symbol (lib_id \"Device:R\") (at 0 0 0) (unit 1) (in_bom yes) (on_board yes) (dnp no) (uuid \"x\"))";
+        let sym = Symbol::from_sexp(&crate::sexp::parser::parse(src).unwrap()).unwrap();
+        assert_eq!(sym.body_style, None);
+        assert_eq!(sym.in_pos_files, None);
+        let out = crate::sexp::writer::write(&sym.to_sexp());
+        assert!(
+            !out.contains("body_style"),
+            "must not invent the token:\n{out}"
+        );
+        assert!(
+            !out.contains("in_pos_files"),
+            "must not invent the token:\n{out}"
+        );
+    }
+
+    #[test]
+    fn fields_autoplaced_serializes_with_yes_not_bare() {
+        let mut sym = Symbol::new("Device:R", 0.0, 0.0);
+        sym.fields_autoplaced = true;
+        let out = crate::sexp::writer::write(&sym.to_sexp());
+        assert!(
+            out.contains("(fields_autoplaced yes)"),
+            "KiCAD 10 always writes the yes/no token, never the bare older form:\n{out}"
+        );
+    }
 
     #[test]
     fn move_to_carries_property_text_along() {

@@ -844,3 +844,47 @@ fn editing_a_tab_indented_sheet_reindents_nothing() {
     }
     assert!(after.contains("(at 30 30)"), "{after}");
 }
+
+/// KiCAD 10's own top-level item order (verified against real eeschema
+/// saves, not guessed): a free-floating `text` block before `junction`, and
+/// `symbol` before `sheet` — with `embedded_fonts` the true last node, after
+/// `sheet_instances`. This crate's own order used to put `text` after wires
+/// and `sheet` before `symbol`, and swept `embedded_fonts` ahead of
+/// `sheet_instances`, so an untouched `text` block, every `sheet`, and the
+/// file's last two nodes all moved on every save even when nothing about
+/// them changed (#21).
+#[test]
+fn top_level_items_serialize_in_kicads_order() {
+    let mut sch = load_minimal();
+    sch.add_text("a note", 1.0, 1.0);
+    sch.add_sheet(konnect_schematic_editor::Sheet::new(
+        "Child",
+        "child.kicad_sch",
+        50.0,
+        50.0,
+        20.0,
+        20.0,
+    ));
+    sch.raw_other
+        .push(parser::parse("(sheet_instances (path \"/\" (page \"1\")))").unwrap());
+    sch.raw_other
+        .push(parser::parse("(embedded_fonts no)").unwrap());
+
+    let out = sch.to_source();
+    let text_pos = out.find("(text \"a note\"").unwrap();
+    let junction_pos = out.find("(junction").unwrap();
+    let symbol_pos = out.find("(symbol").unwrap();
+    let sheet_pos = out.find("(sheet\n").unwrap();
+    let sheet_instances_pos = out.find("(sheet_instances").unwrap();
+    let embedded_fonts_pos = out.find("(embedded_fonts").unwrap();
+
+    assert!(
+        text_pos < junction_pos,
+        "text must precede junction:\n{out}"
+    );
+    assert!(symbol_pos < sheet_pos, "symbol must precede sheet:\n{out}");
+    assert!(
+        sheet_instances_pos < embedded_fonts_pos,
+        "embedded_fonts must be the true last node, after sheet_instances:\n{out}"
+    );
+}

@@ -68,6 +68,13 @@ impl Junction {
 #[derive(Debug, Clone)]
 pub struct Text {
     pub text: String,
+    /// `(exclude_from_sim …)`, present in KiCAD 8+ files, written right after
+    /// the text string and before `(at …)`. `None` for older files that omit
+    /// it. This used to be silently dropped on every round-trip — `Text` had
+    /// no unmodelled-child deny-list at all, unlike `Symbol`/`Sheet` (#143) —
+    /// so any free-floating text block lost the token the moment a save
+    /// touched the file (#21).
+    pub exclude_from_sim: Option<bool>,
     pub at: At,
     pub uuid: String,
     pub effects: Option<Effects>,
@@ -77,6 +84,7 @@ impl Text {
     pub fn new(text: impl Into<String>, x: f64, y: f64) -> Self {
         Text {
             text: text.into(),
+            exclude_from_sim: None,
             at: At::new(x, y),
             uuid: uuid::Uuid::new_v4().to_string(),
             effects: None,
@@ -88,6 +96,7 @@ impl Text {
             .value()
             .ok_or(Error::MissingField("text content"))?
             .to_owned();
+        let exclude_from_sim = node.get_bool("exclude_from_sim");
         let at = node
             .find("at")
             .and_then(At::from_sexp)
@@ -96,6 +105,7 @@ impl Text {
         let effects = node.find("effects").and_then(Effects::from_sexp);
         Ok(Text {
             text,
+            exclude_from_sim,
             at,
             uuid,
             effects,
@@ -103,7 +113,14 @@ impl Text {
     }
 
     pub fn to_sexp(&self) -> SexpNode {
-        let mut c = vec![atom("text"), qstr(self.text.clone()), self.at.to_sexp()];
+        let mut c = vec![atom("text"), qstr(self.text.clone())];
+        if let Some(x) = self.exclude_from_sim {
+            c.push(tagged(
+                "exclude_from_sim",
+                vec![atom(if x { "yes" } else { "no" })],
+            ));
+        }
+        c.push(self.at.to_sexp());
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
@@ -156,5 +173,41 @@ impl NoConnect {
 
     pub fn position(&self) -> (f64, f64) {
         (self.x, self.y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sexp::parser;
+
+    /// A free-floating text block as eeschema writes one, carrying
+    /// `(exclude_from_sim …)` right after the string, before `(at …)`. `Text`
+    /// had no unmodelled-child preservation at all (unlike `Symbol`/`Sheet`),
+    /// so this token was silently discarded on every round-trip rather than
+    /// merely reordered (#21, the same class of loss #143 fixed elsewhere).
+    #[test]
+    fn exclude_from_sim_round_trips_and_keeps_its_position() {
+        let src = "(text \"note\" (exclude_from_sim no) (at 5 5 0) (uuid \"t1\"))";
+        let text = Text::from_sexp(&parser::parse(src).unwrap()).unwrap();
+        assert_eq!(text.exclude_from_sim, Some(false));
+
+        let out = crate::sexp::writer::write(&text.to_sexp());
+        assert!(out.contains("(exclude_from_sim no)"), "{out}");
+        let exclude_pos = out.find("(exclude_from_sim").unwrap();
+        let at_pos = out.find("(at ").unwrap();
+        assert!(
+            exclude_pos < at_pos,
+            "exclude_from_sim must precede at, matching KiCAD's own order:\n{out}"
+        );
+    }
+
+    #[test]
+    fn text_without_exclude_from_sim_does_not_invent_it() {
+        let src = "(text \"note\" (at 5 5 0) (uuid \"t1\"))";
+        let text = Text::from_sexp(&parser::parse(src).unwrap()).unwrap();
+        assert_eq!(text.exclude_from_sim, None);
+        let out = crate::sexp::writer::write(&text.to_sexp());
+        assert!(!out.contains("exclude_from_sim"), "{out}");
     }
 }
