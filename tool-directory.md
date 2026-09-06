@@ -173,7 +173,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Preserves every saved hierarchy instance and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. All-or-nothing: refuses the whole batch (naming the failing index) if any route would touch a third pin or join two pins of the same symbol. |
 
-### `sch_export` · 10 tools
+### `sch_export` · 13 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
 **Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
 
@@ -183,9 +183,12 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `render_schematic_png` | Render a sheet to PNG: kicad-cli SVG rasterized in-process with deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds base64 content so the caller can inspect its own output. |
 | `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
+| `set_connectivity_baseline` | Export the schematic's netlist (kicad-cli kicadsexpr) and store it as the sheet's connectivity baseline under `.konnect/baselines/`, beside the visual baseline, recording the source file hash. |
+| `compare_connectivity_baseline` | Re-export the netlist and compare its pin partition against the stored connectivity baseline (same semantics as `compare_netlists`). "No baseline stored" is an explicit result; a kicad-cli export failure is an explicit "blocked" result, not a silent pass. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
+| `compare_netlists` | Compare two kicad-cli kicadsexpr netlist exports by how they partition component pins into nets — net names ignored. Reports whether the partitions are identical, and when not, nets that split, nets that merged, individual pins that moved to an unrelated net, and pins present in only one of the two files. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. |

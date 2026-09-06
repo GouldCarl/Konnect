@@ -46,7 +46,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "sch_analysis",
         description: "Net connectivity, pin queries, trace paths, overlap/orphan detection, layout lint",
         category: "schematic",
-        tool_count: 16,
+        tool_count: 17,
     },
     ToolsetMeta {
         name: "sch_batch",
@@ -58,7 +58,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "sch_export",
         description: "Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB",
         category: "schematic",
-        tool_count: 10,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "sch_hierarchy",

@@ -96,6 +96,37 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_baseline_compare(args, ctx).await }
         ),
         tool!(
+            "set_connectivity_baseline",
+            "Export the schematic's netlist (kicad-cli kicadsexpr) and store it as the sheet's \
+             connectivity baseline under the project's .konnect/baselines/, alongside the visual \
+             baseline, recording the source file's hash so a later compare can tell design drift \
+             from a stale baseline.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_connectivity_baseline_set(args, ctx).await }
+        ),
+        tool!(
+            "compare_connectivity_baseline",
+            "Re-export the schematic's netlist and compare its pin partition against the stored \
+             connectivity baseline (same semantics as compare_netlists). 'No baseline stored' is \
+             an explicit result, not an error, the same as compare_visual_baseline; a kicad-cli \
+             failure during the re-export is reported as an explicit 'blocked' result rather than \
+             a silent pass.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_connectivity_baseline_compare(args, ctx).await }
+        ),
+        tool!(
             "export_schematic_pdf",
             "Export a schematic sheet to a PDF file using kicad-cli.",
             json!({
@@ -141,6 +172,24 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic"]
             }),
             |args, ctx| async move { handle_export_netlist_summary(args, ctx).await }
+        ),
+        tool!(
+            "compare_netlists",
+            "Compare two kicad-cli kicadsexpr netlist exports by how they partition component \
+             pins into nets — the 'identical pin partition' connectivity gate, e.g. before vs \
+             after a layout tidy-up. Net names are ignored; only which REF.PIN pins share a net \
+             matters. Reports whether the partitions are identical, and when not: nets that \
+             split, nets that merged, individual pins that moved to an unrelated net, and pins \
+             present in only one of the two files.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "netlist_a_path": { "type": "string", "description": "Path to the first kicadsexpr netlist file" },
+                    "netlist_b_path": { "type": "string", "description": "Path to the second kicadsexpr netlist file" }
+                },
+                "required": ["netlist_a_path", "netlist_b_path"]
+            }),
+            |args, ctx| async move { handle_compare_netlists(args, ctx).await }
         ),
         tool!(
             "run_erc",
@@ -479,6 +528,152 @@ async fn handle_baseline_compare(
     Ok(CallToolResult::json(&response))
 }
 
+/// Connectivity baseline paths for a sheet: `.konnect/baselines/<stem>.net`
+/// plus a sidecar `.connectivity.json` recording the source hash, mirroring
+/// [`baseline_paths`]'s visual-baseline naming one directory over.
+fn connectivity_baseline_paths(
+    sch_path: &std::path::Path,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let parent = sch_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("schematic path has no parent directory"))?;
+    let stem = sch_path
+        .file_stem()
+        .ok_or_else(|| anyhow::anyhow!("schematic path has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let dir = parent.join(".konnect").join("baselines");
+    Ok((
+        dir.join(format!("{stem}.net")),
+        dir.join(format!("{stem}.connectivity.json")),
+    ))
+}
+
+async fn handle_connectivity_baseline_set(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    if !sch_path.exists() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: sch_path.display().to_string(),
+            },
+            format!("Schematic not found: {}", sch_path.display()),
+        ));
+    }
+
+    let source_bytes = std::fs::read(&sch_path)?;
+    let (net_path, json_path) = connectivity_baseline_paths(&sch_path)?;
+    std::fs::create_dir_all(net_path.parent().expect("baseline dir has parent"))?;
+    cli::export_netlist(&ctx.config.kicad_cli, &sch_path, &net_path, "kicadsexpr").await?;
+
+    use sha2::Digest as _;
+    let source_sha256 = format!("{:x}", sha2::Sha256::digest(&source_bytes));
+    let meta = json!({
+        "sheet": sch_path.display().to_string(),
+        "source_sha256": source_sha256,
+    });
+    std::fs::write(
+        &json_path,
+        format!("{}\n", serde_json::to_string_pretty(&meta)?),
+    )?;
+
+    // Response fields come from the produced file, never the request: parse
+    // the netlist we just wrote back out rather than trusting the export call
+    // returned successfully.
+    let net_text = std::fs::read_to_string(&net_path)?;
+    let net_count = super::netlist_diff::parse_netlist(&net_text)
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "baseline export at {} could not be parsed: {reason}",
+                net_path.display()
+            )
+        })?
+        .len();
+    let net_bytes = std::fs::metadata(&net_path)?.len();
+
+    Ok(CallToolResult::json(&json!({
+        "baseline_net": net_path.display().to_string(),
+        "baseline_meta": json_path.display().to_string(),
+        "net_bytes": net_bytes,
+        "net_count": net_count,
+        "source_sha256": source_sha256,
+    })))
+}
+
+async fn handle_connectivity_baseline_compare(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let (net_path, json_path) = connectivity_baseline_paths(&sch_path)?;
+    if !net_path.exists() || !json_path.exists() {
+        // An explicit result, not an error — the same shape as
+        // compare_visual_baseline's "no_baseline".
+        return Ok(CallToolResult::json(&json!({
+            "status": "no_baseline",
+            "detail": "No stored connectivity baseline for this sheet; call set_connectivity_baseline first.",
+        })));
+    }
+
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_path)?)?;
+
+    let scratch_dir = tempfile::tempdir()?;
+    let current_net_path = scratch_dir.path().join("current.net");
+    if let Err(error) = cli::export_netlist(
+        &ctx.config.kicad_cli,
+        &sch_path,
+        &current_net_path,
+        "kicadsexpr",
+    )
+    .await
+    {
+        // A check that could not run is BLOCKED, not a silent pass.
+        return Ok(CallToolResult::json(&json!({
+            "status": "blocked",
+            "detail": format!("kicad-cli netlist export failed: {error}"),
+        })));
+    }
+
+    let baseline_text = std::fs::read_to_string(&net_path)?;
+    let baseline_nets = match super::netlist_diff::parse_netlist(&baseline_text) {
+        Ok(nets) => nets,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "stored connectivity baseline at {} is unparseable: {reason}",
+                net_path.display()
+            )))
+        }
+    };
+    let current_text = std::fs::read_to_string(&current_net_path)?;
+    let current_nets = match super::netlist_diff::parse_netlist(&current_text) {
+        Ok(nets) => nets,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "freshly exported netlist for {} is unparseable: {reason}",
+                sch_path.display()
+            )))
+        }
+    };
+
+    let comparison = super::netlist_diff::diff_partitions(&baseline_nets, &current_nets);
+
+    let source_bytes = std::fs::read(&sch_path)?;
+    use sha2::Digest as _;
+    let current_sha = format!("{:x}", sha2::Sha256::digest(&source_bytes));
+    let source_changed = meta["source_sha256"] != json!(current_sha);
+
+    let mut response = serde_json::to_value(&comparison)?;
+    response["status"] = json!(if comparison.identical {
+        "PASS"
+    } else {
+        "DRIFT"
+    });
+    response["source_changed_since_baseline"] = json!(source_changed);
+    Ok(CallToolResult::json(&response))
+}
+
 async fn handle_export_pdf(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -593,6 +788,56 @@ async fn handle_export_netlist_summary(
         "nets": net_names,
         "components": components
     })))
+}
+
+/// Read and parse a kicadsexpr netlist file for [`handle_compare_netlists`].
+/// A missing file is a structured `FileNotFound`; anything else that keeps
+/// this from producing a partition (an I/O error, a parse error, valid
+/// S-expression content with no `(nets ...)` section) is an explicit error
+/// naming the file — never a silent empty result.
+fn load_netlist_for_compare(
+    path: &std::path::Path,
+) -> Result<Vec<super::netlist_diff::ParsedNet>, CallToolResult> {
+    if !path.exists() {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: path.display().to_string(),
+            },
+            format!("Netlist file not found: {}", path.display()),
+        ));
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        CallToolResult::error(format!(
+            "could not read netlist '{}': {error}",
+            path.display()
+        ))
+    })?;
+    super::netlist_diff::parse_netlist(&text).map_err(|reason| {
+        CallToolResult::error(format!(
+            "netlist '{}' is unparseable: {reason}",
+            path.display()
+        ))
+    })
+}
+
+async fn handle_compare_netlists(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path_a = get_path(args, "netlist_a_path")?;
+    let path_b = get_path(args, "netlist_b_path")?;
+
+    let nets_a = match load_netlist_for_compare(&path_a) {
+        Ok(nets) => nets,
+        Err(result) => return Ok(result),
+    };
+    let nets_b = match load_netlist_for_compare(&path_b) {
+        Ok(nets) => nets,
+        Err(result) => return Ok(result),
+    };
+
+    let comparison = super::netlist_diff::diff_partitions(&nets_a, &nets_b);
+    Ok(CallToolResult::json(&serde_json::to_value(&comparison)?))
 }
 
 /// ERC positions ride on the entry itself as `x`/`y`, not as a nested object.
@@ -1276,6 +1521,224 @@ mod netlist_summary_tests {
 }
 
 #[cfg(test)]
+mod netlist_compare_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn write_netlist(
+        dir: &std::path::Path,
+        name: &str,
+        nets: &[(&str, &[(&str, &str)])],
+    ) -> std::path::PathBuf {
+        let mut body = String::from("(export\n\t(version \"E\")\n\t(nets\n");
+        for (index, (net_name, nodes)) in nets.iter().enumerate() {
+            body.push_str(&format!(
+                "\t\t(net (code \"{}\") (name \"{net_name}\")\n",
+                index + 1
+            ));
+            for (reference, pin) in *nodes {
+                body.push_str(&format!(
+                    "\t\t\t(node (ref \"{reference}\") (pin \"{pin}\"))\n"
+                ));
+            }
+            body.push_str("\t\t)\n");
+        }
+        body.push_str("\t)\n)\n");
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn identical_netlists_report_identical_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_netlist(dir.path(), "a.net", &[("GND", &[("R1", "1"), ("R1", "2")])]);
+        let b = write_netlist(dir.path(), "b.net", &[("GND", &[("R1", "2"), ("R1", "1")])]);
+
+        let result = handle_compare_netlists(
+            &json!({ "netlist_a_path": a.display().to_string(), "netlist_b_path": b.display().to_string() }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["identical"], true);
+        assert_eq!(response["net_count_a"], 1);
+        assert_eq!(response["net_count_b"], 1);
+        assert_eq!(response["pins_moved_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_netlist_file_is_an_explicit_file_not_found_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_netlist(dir.path(), "a.net", &[("GND", &[("R1", "1")])]);
+        let missing = dir.path().join("does_not_exist.net");
+
+        let result = handle_compare_netlists(
+            &json!({ "netlist_a_path": a.display().to_string(), "netlist_b_path": missing.display().to_string() }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("file_not_found")
+        );
+        assert!(text.contains("does_not_exist.net"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unparseable_netlist_content_is_an_explicit_error_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_netlist(dir.path(), "a.net", &[("GND", &[("R1", "1")])]);
+        let bogus = dir.path().join("not_a_netlist.net");
+        std::fs::write(&bogus, "(kicad_sch (version 1))").unwrap();
+
+        let result = handle_compare_netlists(
+            &json!({ "netlist_a_path": a.display().to_string(), "netlist_b_path": bogus.display().to_string() }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("not_a_netlist.net"), "{text}");
+        assert!(text.contains("unparseable"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_moved_pin_and_a_split_are_named_in_the_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_netlist(
+            dir.path(),
+            "before.net",
+            &[("BUS", &[("R1", "1"), ("R2", "1"), ("R3", "1")])],
+        );
+        let b = write_netlist(
+            dir.path(),
+            "after.net",
+            &[
+                ("BUS", &[("R1", "1")]),
+                ("NEW_A", &[("R2", "1")]),
+                ("NEW_B", &[("R3", "1")]),
+            ],
+        );
+
+        let result = handle_compare_netlists(
+            &json!({ "netlist_a_path": a.display().to_string(), "netlist_b_path": b.display().to_string() }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["identical"], false);
+        assert_eq!(response["details"]["split"][0]["from"], "BUS");
+        assert_eq!(response["details"]["merged"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn connectivity_baseline_paths_live_under_the_projects_konnect_dir() {
+        let (net, meta) =
+            connectivity_baseline_paths(std::path::Path::new("C:/proj/amp.kicad_sch")).unwrap();
+        assert!(net
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(".konnect/baselines/amp.net"));
+        assert!(meta
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(".konnect/baselines/amp.connectivity.json"));
+    }
+
+    #[tokio::test]
+    async fn compare_connectivity_without_a_baseline_is_an_explicit_result_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sch = dir.path().join("fresh.kicad_sch");
+        std::fs::write(&sch, "(kicad_sch)").unwrap();
+
+        let result = handle_connectivity_baseline_compare(
+            &json!({ "schematic": sch.to_string_lossy() }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "no-baseline is a state, not a failure");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["status"], "no_baseline");
+    }
+
+    /// Needs a real kicad-cli: exercises the full set -> compare round trip
+    /// against a real schematic, on both the happy path (identical) and after
+    /// a connectivity-changing edit.
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli on PATH"]
+    async fn set_then_compare_connectivity_baseline_round_trips_against_real_kicad_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let sch = dir.path().join("amp.kicad_sch");
+        std::fs::write(&sch, crate::tools::blank_schematic_template()).unwrap();
+
+        let cfg = ServerConfig {
+            kicad_cli: std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string()),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        };
+        let live_ctx = ToolContext::new(cfg, Arc::new(crate::router::ToolRouter::new()));
+
+        let set_result = handle_connectivity_baseline_set(
+            &json!({ "schematic": sch.display().to_string() }),
+            &live_ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!set_result.is_error, "{set_result:?}");
+
+        let compare_result = handle_connectivity_baseline_compare(
+            &json!({ "schematic": sch.display().to_string() }),
+            &live_ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!compare_result.is_error, "{compare_result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &compare_result.content[0] else {
+            panic!("expected text");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["status"], "PASS");
+        assert_eq!(response["identical"], true);
+        assert_eq!(response["source_changed_since_baseline"], false);
+    }
+}
+
+#[cfg(test)]
 mod multi_unit_connectivity_tests {
     use super::*;
     use crate::tools::ServerConfig;
@@ -1597,7 +2060,13 @@ mod tests {
         assert!(names.contains(&"render_schematic_png"), "{names:?}");
         assert!(names.contains(&"set_visual_baseline"), "{names:?}");
         assert!(names.contains(&"compare_visual_baseline"), "{names:?}");
-        assert_eq!(names.len(), 10, "sch_export tool count");
+        assert!(names.contains(&"compare_netlists"), "{names:?}");
+        assert!(names.contains(&"set_connectivity_baseline"), "{names:?}");
+        assert!(
+            names.contains(&"compare_connectivity_baseline"),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 13, "sch_export tool count");
     }
 
     #[tokio::test]
