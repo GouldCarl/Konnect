@@ -413,6 +413,59 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
+/// Tools registered under the `sch_fields` toolset rather than
+/// `sch_components`.
+///
+/// The handler and its helpers stay in this file -- they share
+/// `sch_components`' target-binding and readback machinery
+/// (`ComponentTargetUnit`, `component_target_from_source`,
+/// `verified_component_readback`) the same way `sch_batch`'s tools reuse
+/// handlers defined here without living in `tools()` themselves
+/// (crates/konnect-core/src/tools/sch_batch.rs). Registering under a second
+/// toolset name is what keeps `sch_components` at the router's 20-tool soft
+/// cap (`no_toolset_exceeds_max_size`, crates/konnect-core/src/router/mod.rs)
+/// instead of raising it.
+pub fn field_tools() -> Vec<ToolDef> {
+    vec![tool!(
+        "set_field_position",
+        "Move one symbol field -- Reference, Value, or any other property -- to an \
+         absolute sheet position in mm, exactly what KiCad stores in the property's \
+         own (at x y angle). Use this after reset_schematic_field_positions (or the \
+         layout lint) finds a Value or Reference colliding with its own symbol's pins: \
+         reset only puts a field back on the library anchor, which is what collides. \
+         This tool does not touch the library anchor and does not move the symbol \
+         itself -- only the one named field.",
+        json!({
+            "type": "object",
+            "properties": {
+                "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                "reference": { "type": "string", "description": "Component reference designator (e.g. 'R23')" },
+                "field": { "type": "string", "description": "Property name to move (e.g. 'Reference', 'Value')" },
+                "x_mm": { "type": "number", "description": "Absolute sheet X position in mm" },
+                "y_mm": { "type": "number", "description": "Absolute sheet Y position in mm" },
+                "angle_degrees": {
+                    "type": "number",
+                    "description": "Text angle in degrees (0/90/180/270). Unchanged if omitted."
+                },
+                "justify": {
+                    "type": "array",
+                    "description": "Text justification tokens, written into (effects (justify ...)) the way eeschema writes it: 'left'/'right'/'center' and/or 'top'/'bottom' (plus 'mirror'). Omit an axis to leave it centred. The whole field is left unchanged if this argument is omitted entirely.",
+                    "items": {
+                        "type": "string",
+                        "enum": ["left", "right", "center", "top", "bottom", "mirror"]
+                    }
+                },
+                "unit": {
+                    "type": "integer",
+                    "description": "Which placed unit of a multi-unit component to move the field on. Default: every placed unit -- refused if their current field positions disagree, since one absolute position would then silently misplace all but one of them."
+                }
+            },
+            "required": ["schematic", "reference", "field", "x_mm", "y_mm"]
+        }),
+        |args, ctx| async move { handle_set_field_position(args, ctx).await }
+    )]
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn handle_create_schematic(
@@ -4199,6 +4252,276 @@ fn set_property_at(prop: &mut cse::types::Property, x: f64, y: f64, rotation: f6
     true
 }
 
+/// A field's position, angle and justification as currently written --
+/// `(at x y angle)` plus the `(justify ...)` inside `(effects ...)`, read the
+/// same way [`cse::library::field_anchors_of`] reads a library anchor. A
+/// property with no `(at)` reads as the sheet origin, matching how KiCad
+/// itself draws one.
+fn read_field_state(prop: &cse::types::Property) -> (f64, f64, f64, cse::library::FieldJustify) {
+    let (x, y, rot) = prop
+        .sub_nodes
+        .iter()
+        .find(|n| n.tag() == Some("at"))
+        .map(|at| {
+            let scalars = at.scalar_args();
+            let num = |i: usize| {
+                scalars
+                    .get(i)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+            };
+            (num(0), num(1), num(2))
+        })
+        .unwrap_or((0.0, 0.0, 0.0));
+    let justify = cse::library::FieldJustify::of_property(&prop.to_sexp());
+    (x, y, rot, justify)
+}
+
+/// Whether two [`read_field_state`] results describe the same position,
+/// angle and justification, within the tolerance the rest of this module
+/// already uses for mm comparisons.
+fn field_states_agree(
+    a: &(f64, f64, f64, cse::library::FieldJustify),
+    b: &(f64, f64, f64, cse::library::FieldJustify),
+) -> bool {
+    const TOL: f64 = 1e-6;
+    (a.0 - b.0).abs() < TOL && (a.1 - b.1).abs() < TOL && (a.2 - b.2).abs() < TOL && a.3 == b.3
+}
+
+/// Parse `set_field_position`'s `justify` argument into a [`FieldJustify`].
+/// Tokens are order-independent, like the library form they mirror; an axis
+/// with no token for it comes out centred, KiCad's default.
+fn parse_justify(tokens: &[String]) -> cse::library::FieldJustify {
+    use cse::library::{FieldJustify, HorizontalJustify, VerticalJustify};
+    let mut justify = FieldJustify::default();
+    for token in tokens {
+        match token.as_str() {
+            "left" => justify.horizontal = Some(HorizontalJustify::Left),
+            "right" => justify.horizontal = Some(HorizontalJustify::Right),
+            "center" => justify.horizontal = None,
+            "top" => justify.vertical = Some(VerticalJustify::Top),
+            "bottom" => justify.vertical = Some(VerticalJustify::Bottom),
+            "mirror" => justify.mirror = true,
+            _ => {}
+        }
+    }
+    justify
+}
+
+/// Rewrite a property's `(justify ...)` inside its `(effects ...)` in place.
+/// Centred (empty tokens) is spelled by omitting the node entirely, matching
+/// how [`crate::tools::positioned_property`] writes one fresh. A property
+/// with no `(effects ...)` at all is left untouched -- every property this
+/// tool can reach was written by KiCad or by `positioned_property`, and both
+/// always carry one.
+fn set_field_justify(prop: &mut cse::types::Property, justify: cse::library::FieldJustify) {
+    use cse::sexp::{atom, SexpNode};
+
+    let Some(effects) = prop
+        .sub_nodes
+        .iter_mut()
+        .find(|n| n.tag() == Some("effects"))
+    else {
+        return;
+    };
+    let SexpNode::List(children) = effects else {
+        return;
+    };
+    children.retain(|n| n.tag() != Some("justify"));
+    let tokens = justify.tokens();
+    if !tokens.is_empty() {
+        let mut node = vec![atom("justify")];
+        node.extend(tokens.into_iter().map(atom));
+        children.push(SexpNode::List(node));
+    }
+}
+
+/// Move one symbol field to an absolute sheet position, matching the
+/// neighbouring handler conventions used by `move_schematic_component` /
+/// `rotate_schematic_component`: bind a [`ComponentTarget`] before writing,
+/// mutate the in-memory model, write once, then verify the post-write file
+/// against that same bound target before trusting anything it reports.
+///
+/// Unlike a component move, the bound target here is used only to prove
+/// nothing *else* about the component drifted between bind and write -- its
+/// own x/y/rotation/fields never carry a field's position, so verifying
+/// against it does not, and must not, constrain the field write itself.
+async fn handle_set_field_position(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(r) => r.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let field = match require_str(args, "field") {
+        Ok(f) => f.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x_mm = match require_f64(args, "x_mm") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y_mm = match require_f64(args, "y_mm") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let angle_degrees = opt_f64(args, "angle_degrees");
+    let justify_tokens = match crate::tools::opt_str_list(args, "justify") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let unit_arg = opt_f64(args, "unit").map(|u| u as u32);
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
+    };
+
+    // The units this call touches: the caller's choice, or every placed unit
+    // when `unit` is omitted -- but only once they already agree on where
+    // `field` sits, so one absolute position is never silently smeared over
+    // several genuinely different ones.
+    let candidate_units: Vec<&ComponentTargetUnit> = match unit_arg {
+        Some(unit) => {
+            let matches: Vec<&ComponentTargetUnit> =
+                target.units.iter().filter(|u| u.unit == unit).collect();
+            if matches.is_empty() {
+                let available: Vec<u32> = target.units.iter().map(|u| u.unit).collect();
+                return Ok(CallToolResult::error(format!(
+                    "Component '{reference}' has no unit {unit}. Placed units: {available:?}"
+                )));
+            }
+            matches
+        }
+        None => target.units.iter().collect(),
+    };
+
+    let missing_field_units: Vec<u32> = candidate_units
+        .iter()
+        .filter(|u| !u.fields.contains_key(&field))
+        .map(|u| u.unit)
+        .collect();
+    if !missing_field_units.is_empty() {
+        let known: BTreeSet<&String> = candidate_units
+            .iter()
+            .flat_map(|u| u.fields.keys())
+            .collect();
+        return Ok(CallToolResult::error(format!(
+            "Component '{reference}' has no field '{field}' on unit(s) {missing_field_units:?}. \
+             Fields present: {known:?}"
+        )));
+    }
+
+    let selected_uuids: BTreeSet<&str> = candidate_units.iter().map(|u| u.uuid.as_str()).collect();
+    let mut current_by_uuid: BTreeMap<String, (f64, f64, f64, cse::library::FieldJustify)> =
+        BTreeMap::new();
+    for symbol in sch
+        .symbols
+        .iter()
+        .filter(|symbol| selected_uuids.contains(symbol.uuid.as_str()))
+    {
+        let Some(prop) = symbol.properties.iter().find(|p| p.name == field) else {
+            // Guarded above by `missing_field_units`; only reachable if the
+            // in-memory model and the bound target disagree with each other.
+            return Ok(ComponentDeleteTargetError::stale(
+                &sch_path,
+                format!(
+                    "component {reference} unit {} lost its '{field}' property \
+                     between the identity check and the write",
+                    symbol.unit
+                ),
+            )
+            .into_result());
+        };
+        current_by_uuid.insert(symbol.uuid.clone(), read_field_state(prop));
+    }
+
+    if unit_arg.is_none() && current_by_uuid.len() > 1 {
+        let mut states = current_by_uuid.values();
+        let first = states.next().expect("just checked len > 1");
+        if states.any(|state| !field_states_agree(first, state)) {
+            return Ok(CallToolResult::error(format!(
+                "Component '{reference}' has {} units whose '{field}' field sits at \
+                 different positions; pass 'unit' to say which one to move.",
+                current_by_uuid.len()
+            )));
+        }
+    }
+
+    // The anchor is the lowest-numbered selected unit -- `target.units` is
+    // already sorted that way (unit, then uuid).
+    let anchor_uuid = candidate_units[0].uuid.clone();
+    let previous = current_by_uuid
+        .get(&anchor_uuid)
+        .copied()
+        .expect("anchor uuid was just read above");
+
+    for symbol in sch
+        .symbols
+        .iter_mut()
+        .filter(|symbol| selected_uuids.contains(symbol.uuid.as_str()))
+    {
+        let existing = current_by_uuid
+            .get(&symbol.uuid)
+            .copied()
+            .expect("every selected uuid was read above");
+        let rotation = angle_degrees.unwrap_or(existing.2);
+        let justify = match &justify_tokens {
+            Some(tokens) => parse_justify(tokens),
+            None => existing.3,
+        };
+        let prop = symbol
+            .properties
+            .iter_mut()
+            .find(|p| p.name == field)
+            .expect("field presence checked above");
+        set_property_at(prop, x_mm, y_mm, rotation);
+        set_field_justify(prop, justify);
+    }
+
+    sch.overwrite()?;
+
+    let committed = cse::Schematic::load(&sch_path)?;
+    let observed = match verified_component_readback(&sch_path, &committed, &target) {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
+
+    let anchor_symbol = committed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.uuid == anchor_uuid)
+        .expect("anchor uuid verified present by the readback above");
+    let written_prop = anchor_symbol
+        .properties
+        .iter()
+        .find(|p| p.name == field)
+        .expect("field presence verified above");
+    let (written_x, written_y, written_rot, written_justify) = read_field_state(written_prop);
+
+    Ok(CallToolResult::json(&json!({
+        "schematic": observed["schematic"],
+        "reference": reference,
+        "field": field,
+        "uuid": anchor_uuid,
+        "x_mm": written_x,
+        "y_mm": written_y,
+        "angle_degrees": written_rot,
+        "justify": written_justify.tokens(),
+        "unit": unit_arg,
+        "units_updated": candidate_units.len(),
+        "previous": {
+            "x_mm": previous.0,
+            "y_mm": previous.1,
+            "angle_degrees": previous.2,
+            "justify": previous.3.tokens()
+        }
+    })))
+}
+
 async fn handle_replace_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -6018,6 +6341,202 @@ mod tests {
         assert!(
             detail.contains("pin 2") && detail.contains("removed"),
             "{detail}"
+        );
+    }
+
+    /// A schematic with one placed unit whose Value field has drifted onto
+    /// the symbol body -- the shape of the dogfood finding this tool exists
+    /// for (R23/R24, Rudder AFE rebuild).
+    const FIELD_POSITION_FIXTURE: &str = "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"10k\" (at 101.6 54.61 0) (effects (font (size 1.27 1.27)) (justify left)))\n  )\n)\n";
+
+    fn field_position_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("field-position.kicad_sch");
+        std::fs::write(&path, FIELD_POSITION_FIXTURE).unwrap();
+        (dir, path)
+    }
+
+    fn field_position_body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_field_position_moves_a_colliding_value_and_preserves_angle_and_justify() {
+        let (_dir, path) = field_position_fixture();
+        let result = handle_set_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R1",
+                "field": "Value",
+                "x_mm": 120.0,
+                "y_mm": 60.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = field_position_body(&result);
+
+        assert_eq!(body["reference"], json!("R1"));
+        assert_eq!(body["field"], json!("Value"));
+        assert_eq!(body["x_mm"], json!(120.0));
+        assert_eq!(body["y_mm"], json!(60.0));
+        // Neither angle nor justify was given, so both must survive from the
+        // property as it stood before this call.
+        assert_eq!(body["angle_degrees"], json!(0.0));
+        assert_eq!(body["justify"], json!(["left"]));
+        assert_eq!(body["previous"]["x_mm"], json!(101.6));
+        assert_eq!(body["previous"]["y_mm"], json!(54.61));
+        assert_eq!(body["previous"]["justify"], json!(["left"]));
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch.symbols.by_reference("R1").expect("R1");
+        let field = |name: &str| {
+            cse::sexp::writer::write(
+                &sym.properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .unwrap()
+                    .to_sexp(),
+            )
+        };
+        assert!(
+            field("Value").contains("(at 120 60 0)"),
+            "Value must move to the new position, angle unchanged: {}",
+            field("Value")
+        );
+        assert!(
+            field("Value").contains("(justify left)"),
+            "justify must survive untouched: {}",
+            field("Value")
+        );
+        assert!(
+            field("Reference").contains("(at 101.6 46.99 0)"),
+            "Reference must be untouched by a Value-only move: {}",
+            field("Reference")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_field_position_applies_a_new_angle_and_justify_when_given() {
+        let (_dir, path) = field_position_fixture();
+        let result = handle_set_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R1",
+                "field": "Value",
+                "x_mm": 90.0,
+                "y_mm": 50.8,
+                "angle_degrees": 90.0,
+                "justify": ["top"]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = field_position_body(&result);
+
+        assert_eq!(body["angle_degrees"], json!(90.0));
+        assert_eq!(body["justify"], json!(["top"]));
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch.symbols.by_reference("R1").expect("R1");
+        let value = cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|p| p.name == "Value")
+                .unwrap()
+                .to_sexp(),
+        );
+        assert!(value.contains("(at 90 50.8 90)"), "{value}");
+        assert!(value.contains("(justify top)"), "{value}");
+        assert!(
+            !value.contains("(justify left)"),
+            "the old justify must not survive alongside the new one: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_field_position_with_an_empty_justify_centres_the_field() {
+        let (_dir, path) = field_position_fixture();
+        let result = handle_set_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R1",
+                "field": "Value",
+                "x_mm": 101.6,
+                "y_mm": 50.8,
+                "justify": []
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = field_position_body(&result);
+
+        assert_eq!(body["justify"], json!([]));
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !source.contains("justify"),
+            "an explicit empty justify must clear the old one, not just skip writing it: {source}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_field_position_reports_an_unknown_reference() {
+        let (_dir, path) = field_position_fixture();
+        let result = handle_set_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R9",
+                "field": "Value",
+                "x_mm": 0.0,
+                "y_mm": 0.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("stale_target")
+        );
+        // Refused before writing anything.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            FIELD_POSITION_FIXTURE
+        );
+    }
+
+    #[tokio::test]
+    async fn set_field_position_reports_an_unknown_field_and_lists_the_real_ones() {
+        let (_dir, path) = field_position_fixture();
+        let result = handle_set_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R1",
+                "field": "Tolerance",
+                "x_mm": 0.0,
+                "y_mm": 0.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        assert!(text.contains("Reference"), "{text}");
+        assert!(text.contains("Value"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            FIELD_POSITION_FIXTURE
         );
     }
 }
@@ -8242,6 +8761,107 @@ mod multi_unit_component_tests {
             SexpError::Conflict { .. } | SexpError::ItemConflict { .. }
         ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+
+    /// `U1`'s two units anchor Value at genuinely different sheet positions
+    /// ((100,102) and (100,122)) -- exactly the case `unit` exists to
+    /// disambiguate. Omitting it must refuse rather than smear one absolute
+    /// position over both.
+    #[tokio::test]
+    async fn set_field_position_refuses_when_units_disagree_and_unit_is_omitted() {
+        let (_directory, path) = fixture();
+        let result = handle_set_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1",
+                "field": "Value",
+                "x_mm": 150.0,
+                "y_mm": 150.0
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        assert!(text.contains("different positions"), "{text}");
+        assert!(text.contains("unit"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SCHEMATIC);
+    }
+
+    #[tokio::test]
+    async fn set_field_position_with_unit_moves_only_that_units_field() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_set_field_position(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "reference": "U1",
+                    "field": "Value",
+                    "x_mm": 150.0,
+                    "y_mm": 150.0,
+                    "unit": 1
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["uuid"], "22222222-2222-4222-8222-222222222222");
+        assert_eq!(result["units_updated"], 1);
+        assert_eq!(result["x_mm"], 150.0);
+        assert_eq!(result["y_mm"], 150.0);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let value_at = |uuid: &str| {
+            cse::sexp::writer::write(
+                &sch.symbols
+                    .iter()
+                    .find(|s| s.uuid == uuid)
+                    .unwrap()
+                    .properties
+                    .iter()
+                    .find(|p| p.name == "Value")
+                    .unwrap()
+                    .to_sexp(),
+            )
+        };
+        assert!(
+            value_at("22222222-2222-4222-8222-222222222222").contains("(at 150 150 0)"),
+            "unit 1's Value must move: {}",
+            value_at("22222222-2222-4222-8222-222222222222")
+        );
+        assert!(
+            value_at("33333333-3333-4333-8333-333333333333").contains("(at 100 122 0)"),
+            "unit 2's Value must stay put: {}",
+            value_at("33333333-3333-4333-8333-333333333333")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_field_position_reports_an_unknown_unit() {
+        let (_directory, path) = fixture();
+        let result = handle_set_field_position(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1",
+                "field": "Value",
+                "x_mm": 150.0,
+                "y_mm": 150.0,
+                "unit": 5
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        assert!(text.contains("no unit 5"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SCHEMATIC);
     }
 }
 

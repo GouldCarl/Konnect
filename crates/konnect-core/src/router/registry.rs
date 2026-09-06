@@ -37,6 +37,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 20,
     },
     ToolsetMeta {
+        name: "sch_fields",
+        description: "Move an individual symbol field (Reference, Value, or any other property) to an absolute position, independent of the symbol itself",
+        category: "schematic",
+        tool_count: 1,
+    },
+    ToolsetMeta {
         name: "sch_bus",
         description: "Buses, bus entries, and fanning a group of pins out onto a bus",
         category: "schematic",
@@ -147,6 +153,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "project" => Some(project::tools()),
         "sch_components" => Some(sch_components::tools()),
         "sch_wiring" => Some(sch_wiring::tools()),
+        "sch_fields" => Some(sch_components::field_tools()),
         "sch_bus" => Some(sch_bus::tools()),
         "sch_analysis" => Some(sch_analysis::tools()),
         "sch_batch" => Some(sch_batch::tools()),
