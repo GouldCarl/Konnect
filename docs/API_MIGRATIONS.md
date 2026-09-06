@@ -156,7 +156,7 @@ identical without it.
 | `export_manufacturing_package.quantity` | Omit it from export. Manufacturing files are quantity-independent; pass `quantity` to `estimate_cost` for pricing context. |
 | `validate_for_manufacturing.schematic` | Run the board validator without it. Use `check_bom_health(schematic)` for the separate schematic/BOM review. |
 | `estimate_cost.schematic` | Omit it. The estimator counts placed board footprints, which are the components relevant to assembly pricing. |
-| `move_connected.*` (all parameters) | The tool now refuses unconditionally: it never implemented the connected move and silently delegated to a plain symbol move while reporting connections preserved (#315). Use `move_schematic_component`, then re-route the affected nets. The parameters return when the wire-carrying move is actually built. |
+| `move_connected.*` (all parameters, historical) | The tool refused unconditionally for a time: it never implemented the connected move and had silently delegated to a plain symbol move while reporting connections preserved (#315). **Restored** — `move_connected` now moves the symbol and carries labels, power symbols, no-connects and wire endpoints anchored at its old pins, refusing the whole move first if a wire would go diagonal. `schematic`, `reference`, `x`, `y` are live inputs again; see `move_connected`'s tool description. |
 
 These removals narrow the schema to behavior Konnect can verify. They do not change
 the generated files or analysis because the removed values had no implementation.
