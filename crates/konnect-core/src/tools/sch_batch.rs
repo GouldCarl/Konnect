@@ -96,7 +96,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
-             file read/write cycle.",
+             file read/write cycle. All-or-nothing: if any connection's route would touch a \
+             pin outside that connection, or would join two pins of the same symbol, the \
+             whole batch is refused and nothing is written; the error names the failing \
+             connection's index.",
             json!({
                 "type": "object",
                 "properties": {
@@ -580,9 +583,22 @@ async fn handle_batch_connect_pins(
     // Resolve every endpoint from the initial tree before any wire is
     // inserted -- symbols/lib_symbols never change as wires are added, so
     // this is safe to do up front instead of re-resolving per connection.
-    let mut resolved: Vec<(f64, f64, f64, f64)> = Vec::new();
+    // Each resolved entry keeps its position in `connections` (`idx`) so a
+    // later collision can name the failing item.
+    struct Resolved {
+        idx: usize,
+        ref1: String,
+        pin1: String,
+        x1: f64,
+        y1: f64,
+        ref2: String,
+        pin2: String,
+        x2: f64,
+        y2: f64,
+    }
+    let mut resolved: Vec<Resolved> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for conn in &connections {
+    for (idx, conn) in connections.iter().enumerate() {
         let (Some(ref1), Some(pin1), Some(ref2), Some(pin2)) = (
             conn["ref1"].as_str(),
             conn["pin1"].as_str(),
@@ -596,24 +612,90 @@ async fn handle_batch_connect_pins(
             resolve_pin_endpoint(&instances, &lib_syms, ref1, pin1),
             resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
         ) {
-            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((x1, y1, x2, y2)),
+            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push(Resolved {
+                idx,
+                ref1: ref1.to_string(),
+                pin1: pin1.to_string(),
+                x1,
+                y1,
+                ref2: ref2.to_string(),
+                pin2: pin2.to_string(),
+                x2,
+                y2,
+            }),
             (Err(e), _) | (_, Err(e)) => errors.push(e.to_string()),
         }
     }
 
+    // Check every resolved route for collisions before writing any of them:
+    // a batch that shorts even one unrelated pin is refused whole, not
+    // partially applied (BoatDash #14 / #1).
+    let failures: Vec<_> = resolved
+        .iter()
+        .filter_map(|r| {
+            let collisions = super::sch_wiring::detect_route_collisions(
+                &tree,
+                &super::sch_wiring::RouteEndpoint {
+                    reference: &r.ref1,
+                    pin: &r.pin1,
+                    x: r.x1,
+                    y: r.y1,
+                },
+                &super::sch_wiring::RouteEndpoint {
+                    reference: &r.ref2,
+                    pin: &r.pin2,
+                    x: r.x2,
+                    y: r.y2,
+                },
+            );
+            if collisions.is_empty() {
+                None
+            } else {
+                Some(crate::mcp::error::PinCollisionFailure {
+                    connection_index: Some(r.idx),
+                    ref1: r.ref1.clone(),
+                    pin1: r.pin1.clone(),
+                    ref2: r.ref2.clone(),
+                    pin2: r.pin2.clone(),
+                    collisions,
+                })
+            }
+        })
+        .collect();
+    if !failures.is_empty() {
+        return Ok(super::sch_wiring::pin_collision_error(
+            "batch_connect_pins",
+            failures,
+        ));
+    }
+
     // ponytail: re-parses content per wire; incremental tree edits if batches get huge.
     let mut new_content = content;
-    for (x1, y1, x2, y2) in &resolved {
-        new_content = route_between(new_content, *x1, *y1, *x2, *y2);
+    for r in &resolved {
+        new_content = route_between(new_content, r.x1, r.y1, r.x2, r.y2);
     }
 
     if !resolved.is_empty() {
         write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
+    // Derive each connection's reported segments from what was actually
+    // written, not from the request.
+    let connected: Vec<_> = resolved
+        .iter()
+        .map(|r| {
+            json!({
+                "connection_index": r.idx,
+                "ref1": r.ref1, "pin1": r.pin1, "ref2": r.ref2, "pin2": r.pin2,
+                "segments": super::sch_wiring::written_route_segments(&new_content, r.x1, r.y1, r.x2, r.y2)
+            })
+        })
+        .collect();
+
     let mut result = CallToolResult::json(&json!({
         "connected_count": resolved.len(),
-        "errors": errors
+        "errors": errors,
+        "connections": connected
     }));
     result.is_error = resolved.is_empty() && !errors.is_empty();
     Ok(result)
@@ -2010,12 +2092,91 @@ mod batch_place_and_connect_tests {
         (dir, path)
     }
 
+    /// Historical note: before the pin-collision check (BoatDash #14 / #1),
+    /// this exact fixture exercised junction dedup across batch iterations --
+    /// R3-R4's wire landed its endpoint on R1-R2's wire at (110, 100), and
+    /// the assertion was that only one dot came out. That landing point is
+    /// R4's own pin, which is not one of R1-R2's two requested endpoints, so
+    /// it is now exactly the collision this batch must refuse: R1-R2 would
+    /// short R4 onto their net. The whole batch is refused, nothing is
+    /// written, and the failing connection is named by index.
     #[tokio::test]
-    async fn batch_connect_pins_dedupes_junction_and_collects_errors() {
-        // R3-R4's wire T-lands on R1-R2's wire at (110, 100) -- without the
-        // STEP 1 fix, processing the third connection re-detects that same
-        // T-junction from the raw wire list and inserts a second dot.
+    async fn batch_connect_pins_refuses_the_whole_batch_when_one_route_crosses_an_unrelated_pin() {
         let (_d, path) = multi_point_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_batch_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "connections": [
+                    { "ref1": "R1", "pin1": "1", "ref2": "R2", "pin2": "1" },
+                    { "ref1": "R3", "pin1": "1", "ref2": "R4", "pin2": "1" },
+                    { "ref1": "R5", "pin1": "1", "ref2": "R6", "pin2": "1" },
+                    { "ref1": "Rbad", "pin1": "1", "ref2": "R6", "pin2": "1" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "collision must refuse: {result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, before,
+            "a refused batch must write nothing, not even the clean connections"
+        );
+
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["kind"], "pin_collision");
+        let failures = parsed["error"]["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["connection_index"], 0);
+        assert_eq!(failures[0]["ref1"], "R1");
+        assert_eq!(failures[0]["ref2"], "R2");
+        let collisions = failures[0]["collisions"].as_array().unwrap();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0]["reference"], "R4");
+        assert_eq!(collisions[0]["pin"], "1");
+    }
+
+    /// Three independent, non-crossing pairs plus one unresolvable
+    /// reference: the collision check must let a clean batch through and the
+    /// reported segments must come from reading the file back, not from the
+    /// request (each wire's `uuid` only exists once written).
+    fn disjoint_point_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let pin_def = "\t\t\t(pin passive line (at 0 0 0) (length 0)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n";
+        let lib_sym = format!("\t\t(symbol \"Test:PT\"\n{pin_def}\t\t)\n");
+        let inst = |reference: &str, x: f64, y: f64, uuid: &str| {
+            format!(
+                "\t(symbol\n\t\t(lib_id \"Test:PT\")\n\t\t(at {x} {y} 0)\n\t\t(uuid \"{uuid}\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t)\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disjoint.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{}{}{}{}{})\n",
+                lib_sym,
+                inst("R1", 100.0, 100.0, "bbbbbbbb-0000-0000-0000-000000000001"),
+                inst("R2", 120.0, 100.0, "bbbbbbbb-0000-0000-0000-000000000002"),
+                inst("R3", 100.0, 150.0, "bbbbbbbb-0000-0000-0000-000000000003"),
+                inst("R4", 120.0, 150.0, "bbbbbbbb-0000-0000-0000-000000000004"),
+                inst("R5", 100.0, 200.0, "bbbbbbbb-0000-0000-0000-000000000005"),
+                inst("R6", 120.0, 200.0, "bbbbbbbb-0000-0000-0000-000000000006"),
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_writes_every_route_when_none_collide() {
+        let (_d, path) = disjoint_point_schematic();
         let result = handle_batch_connect_pins(
             &json!({
                 "schematic": path.display().to_string(),
@@ -2032,13 +2193,6 @@ mod batch_place_and_connect_tests {
         .unwrap();
         assert!(!result.is_error, "{result:?}");
 
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            after.matches("(junction").count(),
-            1,
-            "the T-junction at (110, 100) must not be re-inserted: {after}"
-        );
-
         let body = match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
             _ => panic!("expected text"),
@@ -2046,6 +2200,34 @@ mod batch_place_and_connect_tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["connected_count"], 3);
         assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
+
+        let connections = parsed["connections"].as_array().unwrap();
+        assert_eq!(connections.len(), 3);
+        let after = std::fs::read_to_string(&path).unwrap();
+        for (conn, (rx1, ry1)) in
+            connections
+                .iter()
+                .zip([(100.0, 100.0), (100.0, 150.0), (100.0, 200.0)])
+        {
+            let segments = conn["segments"].as_array().unwrap();
+            assert_eq!(
+                segments.len(),
+                1,
+                "a same-y pair routes as one straight wire: {segments:?}"
+            );
+            let seg = &segments[0];
+            assert_eq!(seg["y1"], ry1);
+            assert_eq!(seg["y2"], ry1);
+            assert_eq!(seg["x1"], rx1);
+            assert_eq!(seg["x2"], rx1 + 20.0);
+            // The uuid is only known once the wire is written -- proof this
+            // came from a read-back, not an echo of the request.
+            let uuid = seg["uuid"].as_str().expect("uuid from read-back");
+            assert!(
+                after.contains(uuid),
+                "reported uuid {uuid} must actually be in the written file"
+            );
+        }
     }
 }
 

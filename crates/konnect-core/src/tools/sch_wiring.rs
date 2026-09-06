@@ -363,7 +363,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_pins",
             "Connect two component pins by reference and pin number. \
-             Looks up pin coordinates automatically and routes a wire between them.",
+             Looks up pin coordinates automatically and routes a wire between them. \
+             Refuses — writing nothing — if the computed route would touch a pin \
+             outside this connection, or if both pins belong to the same symbol.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2040,6 +2042,170 @@ async fn handle_connect_to_net(
     })))
 }
 
+// ─── Pin-collision detection (BoatDash #14 / #1) ──────────────────────────────
+//
+// `connect_pins`/`batch_connect_pins` used to draw an H(+V) path from the two
+// endpoints' own coordinates with no check of what the path passed through.
+// On a normal grid a bend or run can land on a third symbol's pin and
+// silently merge nets (#1); when the two requested endpoints are two pins of
+// the same symbol, the "route" is a dead-straight short between them even
+// with no bend at all (#14's crystal case: XTAL1/XTAL2 wired directly to
+// each other while the crystal's own pins, merely passed through, ended up
+// in no net). Both are refused here, before anything is written.
+//
+// Geometry only, against every placed pin on the sheet — this does not touch
+// the connectivity model (`sch_connectivity`, owned separately by #13).
+
+/// The two-or-three-segment path `route_between` would draw for these
+/// endpoints, without writing anything.
+fn planned_route_segments(x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<(f64, f64, f64, f64)> {
+    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
+        vec![(x1, y1, x2, y2)]
+    } else {
+        // Mirrors route_between's own bend choice (mid_x = x2, mid_y = y1)
+        // exactly, so the check examines the literal path that gets written.
+        vec![(x1, y1, x2, y1), (x2, y1, x2, y2)]
+    }
+}
+
+/// One endpoint of a requested `connect_pins` route: the pin named in the
+/// call, and its resolved schematic-space position. Bundled so
+/// `detect_route_collisions` takes two of these instead of four bare
+/// reference/pin/x/y arguments.
+pub(crate) struct RouteEndpoint<'a> {
+    pub reference: &'a str,
+    pub pin: &'a str,
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Check the route `route_between` would draw between `from` and `to` for
+/// pins it should not touch.
+///
+/// A pin that is not one of the two requested endpoints and lies on any
+/// segment of the path — interior, or at the L-route's bend — is a
+/// collision. Two endpoints on the same symbol are always a collision, since
+/// that wire is a short regardless of what (if anything) lies between them.
+pub(crate) fn detect_route_collisions(
+    tree: &konnect_sexp::parser::SexpNode,
+    from: &RouteEndpoint,
+    to: &RouteEndpoint,
+) -> Vec<crate::mcp::error::PinCollisionDetail> {
+    use crate::mcp::error::PinCollisionDetail;
+    use konnect_sexp::geometry::{point_on_segment, points_coincident};
+
+    if from.reference == to.reference {
+        return vec![PinCollisionDetail {
+            reference: to.reference.to_string(),
+            pin: to.pin.to_string(),
+            x: to.x,
+            y: to.y,
+        }];
+    }
+
+    let segments = planned_route_segments(from.x, from.y, to.x, to.y);
+    let tol = 0.01;
+    let mut seen = std::collections::HashSet::new();
+    let mut collisions = Vec::new();
+    for (instance, pins) in crate::tools::placed_pins_by_reference(tree) {
+        for (pin, t) in pins {
+            let (px, py) = pin_endpoint(&pin, t);
+            // The two requested endpoints are the point of the exercise —
+            // never a collision, however many segments touch them.
+            if points_coincident(px, py, from.x, from.y, tol)
+                || points_coincident(px, py, to.x, to.y, tol)
+            {
+                continue;
+            }
+            let on_path = segments
+                .iter()
+                .any(|&(sx1, sy1, sx2, sy2)| point_on_segment(px, py, sx1, sy1, sx2, sy2, tol));
+            if on_path {
+                let key = (instance.reference.clone(), pin.number.clone());
+                if seen.insert(key) {
+                    collisions.push(PinCollisionDetail {
+                        reference: instance.reference.clone(),
+                        pin: pin.number.clone(),
+                        x: px,
+                        y: py,
+                    });
+                }
+            }
+        }
+    }
+    collisions
+}
+
+/// Build the refusal result for one or more collided connections, in the
+/// shared structured-error shape both `connect_pins` and
+/// `batch_connect_pins` report.
+pub(crate) fn pin_collision_error(
+    tool: &str,
+    failures: Vec<crate::mcp::error::PinCollisionFailure>,
+) -> CallToolResult {
+    let detail = failures
+        .iter()
+        .map(|f| {
+            let where_ = match f.connection_index {
+                Some(i) => format!("connections[{i}] "),
+                None => String::new(),
+            };
+            let names = f
+                .collisions
+                .iter()
+                .map(|c| format!("{} pin {} at ({:.2}, {:.2})", c.reference, c.pin, c.x, c.y))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{where_}{}.{} -> {}.{} would short {names}",
+                f.ref1, f.pin1, f.ref2, f.pin2
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let message = format!("{tool} refused: {detail}. Nothing written.");
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::PinCollision {
+            tool: tool.to_string(),
+            failures,
+        },
+        message,
+    )
+}
+
+/// Re-parse `content` (as actually written) and report the wire segment(s)
+/// now on the sheet along the same H(+V) path `route_between` draws between
+/// the two endpoints. Never echoes coordinates from the request: the wire
+/// UUIDs only exist once written, so this always reads them back rather than
+/// predicting them.
+pub(crate) fn written_route_segments(
+    content: &str,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> Vec<serde_json::Value> {
+    let Ok(tree) = parse_sexp(content) else {
+        return Vec::new();
+    };
+    let wires = extract_wires(&tree);
+    planned_route_segments(x1, y1, x2, y2)
+        .into_iter()
+        .filter_map(|(sx1, sy1, sx2, sy2)| {
+            wires
+                .iter()
+                .find(|w| {
+                    let tol = 0.01;
+                    (konnect_sexp::geometry::points_coincident(w.x1, w.y1, sx1, sy1, tol)
+                        && konnect_sexp::geometry::points_coincident(w.x2, w.y2, sx2, sy2, tol))
+                        || (konnect_sexp::geometry::points_coincident(w.x1, w.y1, sx2, sy2, tol)
+                            && konnect_sexp::geometry::points_coincident(w.x2, w.y2, sx1, sy1, tol))
+                })
+                .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
+        })
+        .collect()
+}
+
 async fn handle_connect_pins(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -2076,6 +2242,38 @@ async fn handle_connect_pins(
     // Resolve pin2 board-space endpoint
     let (x2, y2) = resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2)?;
 
+    // Refuse — writing nothing — when the computed route would touch a pin
+    // outside the requested connection, or when both endpoints are the same
+    // symbol (#14 / #1).
+    let collisions = detect_route_collisions(
+        &tree,
+        &RouteEndpoint {
+            reference: &ref1,
+            pin: &pin1,
+            x: x1,
+            y: y1,
+        },
+        &RouteEndpoint {
+            reference: &ref2,
+            pin: &pin2,
+            x: x2,
+            y: y2,
+        },
+    );
+    if !collisions.is_empty() {
+        return Ok(pin_collision_error(
+            "connect_pins",
+            vec![crate::mcp::error::PinCollisionFailure {
+                connection_index: None,
+                ref1: ref1.clone(),
+                pin1: pin1.clone(),
+                ref2: ref2.clone(),
+                pin2: pin2.clone(),
+                collisions,
+            }],
+        ));
+    }
+
     // Route wire(s) between the two pin endpoints
     let new_content = route_between(content, x1, y1, x2, y2);
 
@@ -2085,7 +2283,8 @@ async fn handle_connect_pins(
         "connected": {
             "from": { "ref": ref1, "pin": pin1, "x": x1, "y": y1 },
             "to":   { "ref": ref2, "pin": pin2, "x": x2, "y": y2 }
-        }
+        },
+        "segments": written_route_segments(&new_content, x1, y1, x2, y2)
     })))
 }
 
@@ -3802,5 +4001,242 @@ mod batch_no_connect_tests {
         let (out, body) = run(json!([])).await;
         assert_eq!(body["added_count"], 0);
         assert_eq!(out.matches("(no_connect").count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod pin_collision_tests {
+    //! BoatDash #14 / #1: connect_pins must refuse a route that would touch a
+    //! pin outside the requested connection, or whose two endpoints are two
+    //! pins of the same symbol. Coordinates are minimised from
+    //! 01-uart-bridges.kicad_sch in the io-expander corpus (U1 XTAL1/XTAL2,
+    //! Y1 the crystal) -- the real #14 reproduction.
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    // U1 (IC, pins 6/7) and Y1 (crystal, pins 1/2) each placed at their own
+    // origin, so a pin endpoint is its local coordinate with KiCad's Y-up
+    // flipped to screen Y-down (length 0, rotation 0, no mirror). R1 is a lone
+    // extra pin, positioned per test to sit on the route, or left off the
+    // sheet entirely for the clean case.
+    fn crystal_fixture_content(r1: Option<(f64, f64)>) -> String {
+        let pin = |num: &str, x: f64, y: f64| {
+            format!(
+                "\t\t\t\t(pin passive line (at {x} {} 0) (length 0)\n\t\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t\t(number \"{num}\" (effects (font (size 1.27 1.27))))\n\t\t\t\t)\n",
+                -y
+            )
+        };
+        let ic = format!(
+            "\t\t(symbol \"Test:IC\"\n\t\t\t(symbol \"IC_1_1\"\n{}{}\t\t\t)\n\t\t)\n",
+            pin("6", 177.8, 106.68),
+            pin("7", 177.8, 109.22),
+        );
+        let xtal = format!(
+            "\t\t(symbol \"Test:XTAL\"\n\t\t\t(symbol \"XTAL_1_1\"\n{}{}\t\t\t)\n\t\t)\n",
+            pin("1", 157.48, 107.95),
+            pin("2", 165.1, 107.95),
+        );
+        let r_sym = r1
+            .map(|(x, y)| {
+                format!(
+                    "\t\t(symbol \"Test:R\"\n\t\t\t(symbol \"R_1_1\"\n{}\t\t\t)\n\t\t)\n",
+                    pin("1", x, y)
+                )
+            })
+            .unwrap_or_default();
+        let inst = |lib_id: &str, reference: &str, uuid: &str| {
+            format!(
+                "\t(symbol\n\t\t(lib_id \"{lib_id}\")\n\t\t(at 0 0 0)\n\t\t(unit 1)\n\t\t(uuid \"{uuid}\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at 0 0 0)\n\t\t)\n\t)\n"
+            )
+        };
+        let lib_syms = format!("{ic}{xtal}{r_sym}");
+        let mut instances = format!(
+            "{}{}",
+            inst("Test:IC", "U1", "aaaaaaaa-0000-0000-0000-0000000000u1"),
+            inst("Test:XTAL", "Y1", "aaaaaaaa-0000-0000-0000-0000000000y1"),
+        );
+        if r1.is_some() {
+            instances.push_str(&inst(
+                "Test:R",
+                "R1",
+                "aaaaaaaa-0000-0000-0000-0000000000r1",
+            ));
+        }
+        format!(
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n{lib_syms}\t)\n{instances}\t(sheet_instances (path \"/\" (page \"1\")))\n)\n"
+        )
+    }
+
+    fn write_fixture(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crystal.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    fn ep<'a>(reference: &'a str, pin: &'a str, x: f64, y: f64) -> RouteEndpoint<'a> {
+        RouteEndpoint {
+            reference,
+            pin,
+            x,
+            y,
+        }
+    }
+
+    #[tokio::test]
+    async fn two_pins_of_the_same_symbol_are_always_a_collision() {
+        let content = crystal_fixture_content(None);
+        let tree = parse_sexp(&content).unwrap();
+        let collisions = detect_route_collisions(
+            &tree,
+            &ep("U1", "6", 177.8, 106.68),
+            &ep("U1", "7", 177.8, 109.22),
+        );
+        assert_eq!(collisions.len(), 1, "{collisions:?}");
+        assert_eq!(collisions[0].reference, "U1");
+        assert_eq!(collisions[0].pin, "7");
+    }
+
+    #[tokio::test]
+    async fn a_route_touching_nothing_but_its_own_endpoints_is_clean() {
+        // U1.6 -> Y1.1: the L-route bends at (157.48, 106.68); neither U1.7
+        // nor Y1.2 lies on either segment, and there is no third symbol.
+        let content = crystal_fixture_content(None);
+        let tree = parse_sexp(&content).unwrap();
+        let collisions = detect_route_collisions(
+            &tree,
+            &ep("U1", "6", 177.8, 106.68),
+            &ep("Y1", "1", 157.48, 107.95),
+        );
+        assert!(collisions.is_empty(), "{collisions:?}");
+    }
+
+    #[tokio::test]
+    async fn a_third_partys_pin_on_the_segment_interior_is_a_collision() {
+        // R1 sits mid-way along the horizontal leg (y = 106.68) of U1.6 -> Y1.1.
+        let content = crystal_fixture_content(Some((167.64, 106.68)));
+        let tree = parse_sexp(&content).unwrap();
+        let collisions = detect_route_collisions(
+            &tree,
+            &ep("U1", "6", 177.8, 106.68),
+            &ep("Y1", "1", 157.48, 107.95),
+        );
+        assert_eq!(collisions.len(), 1, "{collisions:?}");
+        assert_eq!(collisions[0].reference, "R1");
+    }
+
+    #[tokio::test]
+    async fn a_third_partys_pin_at_the_l_routes_bend_is_a_collision() {
+        // The bend of U1.6 -> Y1.1 is (157.48, 106.68); a pin exactly there
+        // must be caught too, not just interior points.
+        let content = crystal_fixture_content(Some((157.48, 106.68)));
+        let tree = parse_sexp(&content).unwrap();
+        let collisions = detect_route_collisions(
+            &tree,
+            &ep("U1", "6", 177.8, 106.68),
+            &ep("Y1", "1", 157.48, 107.95),
+        );
+        assert_eq!(collisions.len(), 1, "{collisions:?}");
+        assert_eq!(collisions[0].reference, "R1");
+    }
+
+    #[tokio::test]
+    async fn connect_pins_refuses_and_writes_nothing_for_same_symbol_endpoints() {
+        let content = crystal_fixture_content(None);
+        let (_d, path) = write_fixture(&content);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "U1", "pin1": "6",
+                "ref2": "U1", "pin2": "7"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "same-symbol route must be refused");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a refused connect_pins must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_pins_refuses_and_writes_nothing_when_a_bystander_pin_is_on_the_path() {
+        let content = crystal_fixture_content(Some((167.64, 106.68)));
+        let (_d, path) = write_fixture(&content);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "U1", "pin1": "6",
+                "ref2": "Y1", "pin2": "1"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "a route over R1's pin must be refused");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a refused connect_pins must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_pins_reports_segments_read_back_from_the_written_file() {
+        // A clean U1.6 -> Y1.1 route succeeds and reports the wire segments now
+        // on the sheet, each carrying a uuid that exists in the file.
+        let content = crystal_fixture_content(None);
+        let (_d, path) = write_fixture(&content);
+        let result = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "U1", "pin1": "6",
+                "ref2": "Y1", "pin2": "1"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.is_error,
+            "clean route must succeed: {:?}",
+            result.content
+        );
+        let body: serde_json::Value = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        };
+        let segments = body["segments"].as_array().expect("segments array");
+        assert!(!segments.is_empty(), "expected written segments: {body}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        for seg in segments {
+            let uuid = seg["uuid"].as_str().expect("segment uuid");
+            assert!(
+                after.contains(uuid),
+                "reported segment uuid {uuid} must exist in the written file"
+            );
+        }
     }
 }
