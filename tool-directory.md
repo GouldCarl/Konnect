@@ -80,7 +80,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. |
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. |
-| `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
+| `move_connected` | Move a symbol, translating dangling stub wires (and any label/power symbol/no-connect on them) whole and stretching only wire ends genuinely attached elsewhere; refuses a stretch that would go diagonal or short a third-party pin. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
 | `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm`. |

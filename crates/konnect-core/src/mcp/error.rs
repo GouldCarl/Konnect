@@ -76,6 +76,18 @@ pub enum ToolErrorKind {
         dy: f64,
         wires: Vec<String>,
     },
+    /// A wire-carrying move would stretch a wire whose far end genuinely
+    /// stays attached to something else, and the new (orthogonal) span would
+    /// sweep over a pin that is neither the moved symbol's own nor that
+    /// far-end attachment. Refused before any write; `wires` names each
+    /// offending span and the third-party pin(s) it would short. See
+    /// BoatDash dogfood FINDINGS.md #1.
+    WouldShortPin {
+        reference: String,
+        dx: f64,
+        dy: f64,
+        wires: Vec<String>,
+    },
 }
 
 impl ToolErrorKind {
@@ -94,6 +106,7 @@ impl ToolErrorKind {
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::HandlerError { .. } => "handler_error",
             Self::WouldGoDiagonal { .. } => "would_go_diagonal",
+            Self::WouldShortPin { .. } => "would_short_pin",
         }
     }
 }
@@ -227,6 +240,12 @@ mod tests {
             ToolErrorKind::UnsafeFileFallback { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
             ToolErrorKind::WouldGoDiagonal {
+                reference: "R1".into(),
+                dx: 1.0,
+                dy: 2.0,
+                wires: vec!["p".into()],
+            },
+            ToolErrorKind::WouldShortPin {
                 reference: "R1".into(),
                 dx: 1.0,
                 dy: 2.0,
