@@ -1673,35 +1673,58 @@ pub(crate) fn validate_sheet_instance_state(
 
     let mut stale_symbols = Vec::new();
     for symbol in &schematic.symbols {
+        // KiCad keeps other projects' saved `(instances ...)` blocks on a
+        // schematic file shared across hierarchies (or one that used to stand
+        // alone and is now also reused elsewhere): an eeschema re-save adds the
+        // current project's instance and removes none of the foreign ones.
+        // This check is Konnect's own proof obligation for the CURRENT
+        // project, not a request to police every other project's saved
+        // metadata, so it must ignore foreign blocks exactly as eeschema does
+        // (#20; upstream #387, #394 compared the whole unfiltered list).
         let instances = symbol.instances();
-        let mut observed = instances
+        let current_project_instances = instances
+            .iter()
+            .filter(|instance| instance.project.as_deref() == Some(context.project_name.as_str()))
+            .collect::<Vec<_>>();
+        let missing_current_project = current_project_instances.is_empty();
+
+        let mut observed = current_project_instances
             .iter()
             .filter_map(|instance| Some((instance.project.clone()?, instance.path.clone()?)))
             .collect::<Vec<_>>();
         observed.sort();
         let symbol_reference = symbol.reference().filter(|reference| !reference.is_empty());
-        let malformed = instances.iter().any(|instance| {
+        let malformed = current_project_instances.iter().any(|instance| {
             instance.project.as_deref().is_none_or(str::is_empty)
                 || instance.path.as_deref().is_none_or(str::is_empty)
                 || instance.reference.as_deref().is_none_or(str::is_empty)
                 || instance.unit.is_none()
         });
-        let wrong_unit = instances
+        let wrong_unit = current_project_instances
             .iter()
             .any(|instance| instance.unit != Some(symbol.unit));
-        let wrong_reference = symbol_reference.is_none_or(|reference| {
-            let prefix = reference_prefix(reference);
-            !instances
-                .iter()
-                .any(|instance| instance.reference.as_deref() == Some(reference))
-                || instances.iter().any(|instance| {
-                    instance
-                        .reference
-                        .as_deref()
-                        .is_none_or(|candidate| reference_prefix(candidate) != prefix)
-                })
-        });
-        if malformed || observed != expected || wrong_unit || wrong_reference {
+        // A symbol with no current-project instance at all has nothing to
+        // compare a reference against here — that case is reported once, below,
+        // with its own remedy text instead of a spurious second reason.
+        let wrong_reference = !missing_current_project
+            && symbol_reference.is_none_or(|reference| {
+                let prefix = reference_prefix(reference);
+                !current_project_instances
+                    .iter()
+                    .any(|instance| instance.reference.as_deref() == Some(reference))
+                    || current_project_instances.iter().any(|instance| {
+                        instance
+                            .reference
+                            .as_deref()
+                            .is_none_or(|candidate| reference_prefix(candidate) != prefix)
+                    })
+            });
+        if missing_current_project
+            || malformed
+            || observed != expected
+            || wrong_unit
+            || wrong_reference
+        {
             let identity = symbol_reference.unwrap_or(symbol.uuid.as_str());
             let format_paths = |paths: &[(String, String)]| {
                 paths
@@ -1711,16 +1734,22 @@ pub(crate) fn validate_sheet_instance_state(
                     .join(", ")
             };
             let mut reasons = Vec::new();
-            if malformed {
-                reasons
-                    .push("missing or malformed project/path/reference/unit metadata".to_string());
-            }
-            if observed != expected {
+            if missing_current_project {
+                reasons.push(format!(
+                    "no instance entry for project '{}'; open the project in eeschema and save \
+                     once — it adds the missing instance",
+                    context.project_name
+                ));
+            } else if observed != expected {
                 reasons.push(format!(
                     "observed [{}], expected [{}]",
                     format_paths(&observed),
                     format_paths(&expected)
                 ));
+            }
+            if malformed {
+                reasons
+                    .push("missing or malformed project/path/reference/unit metadata".to_string());
             }
             if wrong_unit {
                 reasons.push(format!(
