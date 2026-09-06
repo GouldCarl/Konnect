@@ -4628,6 +4628,77 @@ mod tests {
         );
     }
 
+    /// #16: a rotated passive's Reference/Value must not render vertically
+    /// through its neighbours. KiCad adds the symbol's own rotation to a
+    /// field's *stored* angle when it draws (see `field_at`), so the fix is
+    /// NOT to add `rotation` here too -- that doubles it and reproduces the
+    /// bug. Device:R's own library anchor stores its fields at angle 90 (this
+    /// is KiCad's default vertical-body resistor), and real eeschema output
+    /// carries that same 90 through unchanged at every instance rotation:
+    /// verified against `hardware/io-expander/io-expander/01-uart-bridges.kicad_sch`
+    /// R13-R20 (rotation 90, Reference/Value angle 90) in the BoatDash corpus.
+    /// This locks that behaviour in for every quadrant so a future change
+    /// cannot silently start adding rotation into the stored angle again.
+    #[tokio::test]
+    async fn rotated_passive_field_angle_follows_the_library_anchor_not_the_rotation() {
+        let lib_symbols = "(lib_symbols\n    (symbol \"Device:R\"\n      \
+             (property \"Reference\" \"R\" (at 2.032 0 90))\n      \
+             (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n";
+        for rotation in [0.0, 90.0, 180.0, 270.0] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rotated.kicad_sch");
+            std::fs::write(
+                &path,
+                format!(
+                    "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  \
+                     (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  \
+                     {lib_symbols})\n"
+                ),
+            )
+            .unwrap();
+
+            let result = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "Device:R",
+                    "x": 100.0,
+                    "y": 100.0,
+                    "rotation": rotation,
+                    "reference": "R1",
+                    "value": "10k"
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "rotation {rotation}: {result:?}");
+
+            let sch = cse::Schematic::load(&path).unwrap();
+            let sym = sch
+                .symbols
+                .iter()
+                .find(|s| s.reference() == Some("R1"))
+                .unwrap();
+            for name in ["Reference", "Value"] {
+                let prop = sym.properties.iter().find(|p| p.name == name).unwrap();
+                let sexp = cse::sexp::writer::write(&prop.to_sexp());
+                let at = sexp.find("(at ").expect("at present") + 4;
+                let angle: f64 = sexp[at..][..sexp[at..].find(')').unwrap()]
+                    .trim()
+                    .rsplit(' ')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(
+                    angle, 90.0,
+                    "rotation {rotation}: {name} angle must stay the library's own 90, \
+                     never added to the instance rotation: {sexp}"
+                );
+            }
+        }
+    }
+
     /// A schematic keeps its own copy of every symbol, so editing the library
     /// leaves the sheet drawing the old shape — what KiCad reports as
     /// "doesn't match copy in library".
