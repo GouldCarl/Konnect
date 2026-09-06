@@ -329,6 +329,51 @@ async fn native_placement_refuses_stale_instance_metadata_without_writing() {
     }
 }
 
+/// #20: KiCad keeps a foreign project's saved `(instances ...)` block
+/// untouched on a schematic file shared with, or once standalone and now
+/// reused inside, another project — an eeschema re-save adds the current
+/// project's instance and removes none of the foreign ones. Every existing
+/// symbol here still carries exactly one correct `complex_hierarchy` entry;
+/// a second, unrelated project's entry alongside it must not by itself
+/// refuse placement (upstream #387, #394 compared the whole unfiltered list
+/// and refused here).
+#[tokio::test]
+async fn native_placement_tolerates_a_foreign_project_instance_block_alongside_its_own() {
+    for name in PLACERS {
+        let (_directory, root, child) = fixture(false);
+        let mut schematic = Schematic::load(&child).unwrap();
+        let existing_uuids: Vec<String> =
+            schematic.symbols.iter().map(|s| s.uuid.clone()).collect();
+        for symbol in schematic.symbols.iter_mut() {
+            let reference = symbol.reference().unwrap_or_default().to_string();
+            let unit = symbol.unit;
+            symbol.set_instance_path("isolated_inputs", "/foreign-root", &reference, unit);
+        }
+        schematic.overwrite().unwrap();
+        let root_before = std::fs::read(&root).unwrap();
+
+        let result = place(name, &child).await;
+        assert!(!result.is_error, "{name}: {result:?}");
+
+        let committed = Schematic::load(&child).unwrap();
+        for uuid in &existing_uuids {
+            let symbol = committed.symbols.iter().find(|s| &s.uuid == uuid).unwrap();
+            assert!(
+                symbol
+                    .instances()
+                    .iter()
+                    .any(|instance| instance.project.as_deref() == Some("isolated_inputs")),
+                "{name}: foreign block on {uuid} should survive untouched"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&root).unwrap(),
+            root_before,
+            "{name}: root sheet must not be touched by a child-sheet placement"
+        );
+    }
+}
+
 #[tokio::test]
 async fn native_placement_refuses_ambiguous_ownership_without_writing() {
     for name in PLACERS {

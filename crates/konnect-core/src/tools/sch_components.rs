@@ -771,15 +771,56 @@ impl ComponentTargetUnit {
     }
 }
 
+/// The current project's name for `path`, only when structurally proven by a
+/// real `.kicad_pro` on disk — never a filename guess. `Ok(None)` means no
+/// project file was found (a bare fixture, or a file that genuinely stands
+/// alone): callers must then fall back to the old, unscoped behaviour, since
+/// nothing here can otherwise tell "ours" from "a different project's" saved
+/// instance block. A discovery error (unreadable directory) or unresolved
+/// ownership conflict propagates, matching `sheet_instance_context` (#20).
+fn structurally_proven_project(
+    sch_path: &std::path::Path,
+) -> Result<Option<String>, CallToolResult> {
+    crate::tools::resolve_schematic_ownership(sch_path)
+        .map(|ownership| {
+            ownership.map(|owner| {
+                owner
+                    .project_file
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        })
+        .map_err(|error| error.into_tool_result())
+}
+
 /// Inspect every record before sorting: duplicate identities and conflicting
 /// project/unit records must not be collapsed into a plausible first answer.
+///
+/// `current_project`, when structurally proven (a real `.kicad_pro` was found
+/// and this file's ownership resolved against it — see
+/// `crate::tools::resolve_schematic_ownership`), scopes every check to that
+/// project's own instance records: a second project's saved block on a shared
+/// or once-standalone schematic file is KiCad's own business, never edited or
+/// validated by eeschema when it saves a different project, so a mutation
+/// here must ignore it too (#20; upstream #387, #394 required every instance
+/// to agree). When ownership was not proven (no `.kicad_pro` on disk), this
+/// keeps the original all-instances behaviour: nothing here can tell "ours"
+/// from "foreign" without a project file, so any second project is ambiguous.
 fn checked_instance_paths(
     path: &std::path::Path,
     symbol: &cse::Symbol,
+    current_project: Option<&str>,
 ) -> Result<Vec<(String, String)>, ComponentDeleteTargetError> {
     let mut identities = BTreeSet::new();
     let mut projects = BTreeSet::new();
     for instance in symbol.instances() {
+        if let Some(current) = current_project {
+            if instance.project.as_deref() != Some(current) {
+                continue;
+            }
+        }
         let (Some(project), Some(instance_path), Some(reference), Some(unit)) = (
             instance.project,
             instance.path,
@@ -814,6 +855,18 @@ fn checked_instance_paths(
                     .map(|entry| format!("{entry:?}"))
                     .collect(),
             });
+        }
+    }
+    if let Some(current) = current_project {
+        if identities.is_empty() {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "component UUID {} has no instance entry for project '{current}'; open the \
+                     project in eeschema and save once — it adds the missing instance",
+                    symbol.uuid
+                ),
+            ));
         }
     }
     Ok(identities.into_iter().collect())
@@ -932,6 +985,7 @@ fn component_target_from_source(
     path: &std::path::Path,
     content: &str,
     reference: &str,
+    current_project: Option<&str>,
 ) -> Result<ComponentTarget, ComponentDeleteTargetError> {
     let tree =
         parse_sexp(content).map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
@@ -988,6 +1042,14 @@ fn component_target_from_source(
         }
         for instances in node.find_all("instances") {
             for project in instances.find_all("project") {
+                // A different project's saved reference designator is its own
+                // business — only the current project's instance path has to
+                // agree with the requested reference (#20, #157).
+                if let Some(current) = current_project {
+                    if project.get(1).and_then(|value| value.as_str()) != Some(current) {
+                        continue;
+                    }
+                }
                 for path_node in project.find_all("path") {
                     let Some(instance_reference) = path_node.find_str("reference") else {
                         return Err(ComponentDeleteTargetError::stale(
@@ -1012,7 +1074,7 @@ fn component_target_from_source(
         let symbol = cse::sexp::parser::parse(&item.source)
             .and_then(|node| cse::Symbol::from_sexp(&node))
             .map_err(|error| ComponentDeleteTargetError::stale(path, error.to_string()))?;
-        let instance_paths = checked_instance_paths(path, &symbol)?;
+        let instance_paths = checked_instance_paths(path, &symbol, current_project)?;
         units.push(ComponentTargetUnit {
             uuid,
             unit: instance.unit,
@@ -1058,6 +1120,7 @@ fn component_mutation_readback_from_schematic(
     committed: &cse::Schematic,
     expected_uuids: &[String],
     expected_reference: Option<&str>,
+    current_project: Option<&str>,
 ) -> Result<serde_json::Value, CallToolResult> {
     if !super::same_schematic_document(path, committed.filepath()) {
         return Err(ComponentDeleteTargetError::stale(
@@ -1170,8 +1233,8 @@ fn component_mutation_readback_from_schematic(
                 .into_result());
             }
         }
-        let instance_paths =
-            checked_instance_paths(path, symbol).map_err(|error| error.into_result())?;
+        let instance_paths = checked_instance_paths(path, symbol, current_project)
+            .map_err(|error| error.into_result())?;
         if component_instances
             .as_ref()
             .is_some_and(|expected| expected != &instance_paths)
@@ -1193,6 +1256,15 @@ fn component_mutation_readback_from_schematic(
             .filter(|node| node.tag() == Some("instances"))
         {
             for project in instances.find_all("project") {
+                // A different project's saved reference designator is its own
+                // business (each project annotates independently) — only the
+                // current project's instance path has to agree with this
+                // symbol's rendered Reference property (#20, #157).
+                if let Some(current) = current_project {
+                    if project.value() != Some(current) {
+                        continue;
+                    }
+                }
                 for path_node in project.find_all("path") {
                     let Some(instance_reference) = path_node.get_value("reference") else {
                         return Err(ComponentDeleteTargetError::stale(
@@ -1257,21 +1329,29 @@ fn component_mutation_readback_from_schematic(
 fn load_component_mutation_readback(
     path: &std::path::Path,
     expected: &ComponentTarget,
+    current_project: Option<&str>,
 ) -> anyhow::Result<Result<serde_json::Value, CallToolResult>> {
     let committed = cse::Schematic::load(path)?;
-    Ok(verified_component_readback(path, &committed, expected))
+    Ok(verified_component_readback(
+        path,
+        &committed,
+        expected,
+        current_project,
+    ))
 }
 
 fn verified_component_readback(
     path: &std::path::Path,
     committed: &cse::Schematic,
     expected: &ComponentTarget,
+    current_project: Option<&str>,
 ) -> Result<serde_json::Value, CallToolResult> {
     let observed = component_mutation_readback_from_schematic(
         path,
         committed,
         &expected.uuids(),
         Some(&expected.reference),
+        current_project,
     )?;
     verify_component_expectations(path, &observed, &expected.units)?;
     Ok(observed)
@@ -1346,6 +1426,7 @@ pub(crate) fn placed_component_readback(
         committed,
         &[uuid.to_owned()],
         expected.fields.get("Reference").map(String::as_str),
+        Some(context.project_name.as_str()),
     )?;
     verify_component_expectations(sch_path, &result, std::slice::from_ref(expected))?;
     if let Err(error) = crate::tools::validate_sheet_instance_state(sch_path, committed, context) {
@@ -2105,9 +2186,18 @@ async fn handle_edit_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    let current_project = match structurally_proven_project(&sch_path) {
+        Ok(project) => project,
+        Err(error) => return Ok(error),
+    };
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let target = match component_target_from_source(&sch_path, &expected, &reference) {
+    let target = match component_target_from_source(
+        &sch_path,
+        &expected,
+        &reference,
+        current_project.as_deref(),
+    ) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -2233,11 +2323,14 @@ async fn handle_edit_schematic_component(
         commit_command(&sch_path, &command)?;
     }
 
-    let observed =
-        match load_component_mutation_readback(&sch_path, &target.with_fields(&expected_fields))? {
-            Ok(observed) => observed,
-            Err(error) => return Ok(error),
-        };
+    let observed = match load_component_mutation_readback(
+        &sch_path,
+        &target.with_fields(&expected_fields),
+        current_project.as_deref(),
+    )? {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
     let mut result = json!({
         "reference": observed["reference"],
         "changes": changed
@@ -2375,8 +2468,17 @@ async fn handle_move_schematic_component(
         Vec::new()
     };
 
+    let current_project = match structurally_proven_project(&sch_path) {
+        Ok(project) => project,
+        Err(error) => return Ok(error),
+    };
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let mut target = match component_target_from_source(
+        &sch_path,
+        &sch.to_source(),
+        &reference,
+        current_project.as_deref(),
+    ) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -2403,10 +2505,11 @@ async fn handle_move_schematic_component(
     }
     sch.overwrite()?;
     let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
-    let observed = match load_component_mutation_readback(&sch_path, &target)? {
-        Ok(observed) => observed,
-        Err(error) => return Ok(error),
-    };
+    let observed =
+        match load_component_mutation_readback(&sch_path, &target, current_project.as_deref())? {
+            Ok(observed) => observed,
+            Err(error) => return Ok(error),
+        };
     let mut result = json!({
         "moved": observed["reference"],
         "x": observed["x"],
@@ -2480,8 +2583,17 @@ async fn handle_rotate_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    let current_project = match structurally_proven_project(&sch_path) {
+        Ok(project) => project,
+        Err(error) => return Ok(error),
+    };
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let mut target = match component_target_from_source(
+        &sch_path,
+        &sch.to_source(),
+        &reference,
+        current_project.as_deref(),
+    ) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -2512,10 +2624,11 @@ async fn handle_rotate_schematic_component(
         symbol.set_rotation(new_rotation);
     }
     sch.overwrite()?;
-    let observed = match load_component_mutation_readback(&sch_path, &target)? {
-        Ok(observed) => observed,
-        Err(error) => return Ok(error),
-    };
+    let observed =
+        match load_component_mutation_readback(&sch_path, &target, current_project.as_deref())? {
+            Ok(observed) => observed,
+            Err(error) => return Ok(error),
+        };
     let mut result = json!({
         "rotated": observed["reference"],
         "rotation": observed["rotation"],
@@ -2826,9 +2939,18 @@ async fn handle_add_component_annotation(
         )));
     }
 
+    let current_project = match structurally_proven_project(&sch_path) {
+        Ok(project) => project,
+        Err(error) => return Ok(error),
+    };
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let target = match component_target_from_source(&sch_path, &expected, &reference) {
+    let target = match component_target_from_source(
+        &sch_path,
+        &expected,
+        &reference,
+        current_project.as_deref(),
+    ) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -2858,6 +2980,7 @@ async fn handle_add_component_annotation(
     let observed = match load_component_mutation_readback(
         &sch_path,
         &target.with_fields(&BTreeMap::from([(key.clone(), value.clone())])),
+        current_project.as_deref(),
     )? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -2903,6 +3026,10 @@ async fn handle_group_components(
         return Ok(CallToolResult::error("No references provided"));
     }
 
+    let current_project = match structurally_proven_project(&sch_path) {
+        Ok(project) => project,
+        Err(error) => return Ok(error),
+    };
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
     let mut item_ids = Vec::new();
@@ -2918,7 +3045,12 @@ async fn handle_group_components(
         if !seen.insert(reference.to_owned()) {
             continue;
         }
-        let target = match component_target_from_source(&sch_path, &expected, reference) {
+        let target = match component_target_from_source(
+            &sch_path,
+            &expected,
+            reference,
+            current_project.as_deref(),
+        ) {
             Ok(target) => target,
             Err(ComponentDeleteTargetError::Stale { reason, .. })
                 if reason.contains("is not present") =>
@@ -2968,6 +3100,7 @@ async fn handle_group_components(
             &sch_path,
             &committed,
             &target.with_fields(&BTreeMap::from([("Group".to_owned(), group_name.clone())])),
+            current_project.as_deref(),
         ) {
             Ok(observed) => observed,
             Err(error) => return Ok(error),
@@ -5668,8 +5801,9 @@ mod multi_unit_component_tests {
     fn native_readback_intent_mismatch(field: &str) {
         let (_directory, path) = eeschema_fixture();
         let mut committed = cse::Schematic::load(&path).unwrap();
-        let target = component_target_from_source(&path, &committed.to_source(), "U1").unwrap();
-        assert!(verified_component_readback(&path, &committed, &target).is_ok());
+        let target =
+            component_target_from_source(&path, &committed.to_source(), "U1", None).unwrap();
+        assert!(verified_component_readback(&path, &committed, &target, None).is_ok());
         // Keep UUID and Reference intact. Change every unit's hierarchy together
         // so the expected-path comparison, not a cross-unit conflict, must fire.
         for symbol in committed
@@ -5715,7 +5849,7 @@ mod multi_unit_component_tests {
         }
         committed.overwrite().unwrap();
         let reloaded = cse::Schematic::load(&path).unwrap();
-        let error = verified_component_readback(&path, &reloaded, &target).unwrap_err();
+        let error = verified_component_readback(&path, &reloaded, &target, None).unwrap_err();
         assert_eq!(
             extract_error_kind(&error).as_deref(),
             Some("stale_target"),
@@ -5757,7 +5891,7 @@ mod multi_unit_component_tests {
         for field in ["Value", "Footprint", "Datasheet", "MPN", "Group"] {
             let (_directory, path) = eeschema_fixture();
             let mut committed = cse::Schematic::load(&path).unwrap();
-            let target = component_target_from_source(&path, &committed.to_source(), "U1")
+            let target = component_target_from_source(&path, &committed.to_source(), "U1", None)
                 .unwrap()
                 .with_fields(&BTreeMap::from([(
                     field.to_owned(),
@@ -5774,7 +5908,8 @@ mod multi_unit_component_tests {
             assert!(verified_component_readback(
                 &path,
                 &cse::Schematic::load(&path).unwrap(),
-                &target
+                &target,
+                None
             )
             .is_ok());
             committed
@@ -5784,9 +5919,13 @@ mod multi_unit_component_tests {
                 .unwrap()
                 .set_property(field, "wrong-value");
             committed.overwrite().unwrap();
-            let error =
-                verified_component_readback(&path, &cse::Schematic::load(&path).unwrap(), &target)
-                    .unwrap_err();
+            let error = verified_component_readback(
+                &path,
+                &cse::Schematic::load(&path).unwrap(),
+                &target,
+                None,
+            )
+            .unwrap_err();
             assert_eq!(
                 extract_error_kind(&error).as_deref(),
                 Some("stale_target"),
@@ -5800,7 +5939,8 @@ mod multi_unit_component_tests {
         for corruption in ["project", "duplicate", "unit", "cross-unit"] {
             let (_directory, path) = eeschema_fixture();
             let mut committed = cse::Schematic::load(&path).unwrap();
-            let target = component_target_from_source(&path, &committed.to_source(), "U1").unwrap();
+            let target =
+                component_target_from_source(&path, &committed.to_source(), "U1", None).unwrap();
             let symbol = committed
                 .symbols
                 .iter_mut()
@@ -5830,7 +5970,7 @@ mod multi_unit_component_tests {
                 _ => unreachable!(),
             }
             if corruption != "cross-unit" {
-                let error = checked_instance_paths(&path, symbol)
+                let error = checked_instance_paths(&path, symbol, None)
                     .unwrap_err()
                     .into_result();
                 assert_eq!(
@@ -5841,13 +5981,13 @@ mod multi_unit_component_tests {
             }
             committed.overwrite().unwrap();
             let reloaded = cse::Schematic::load(&path).unwrap();
-            let error = verified_component_readback(&path, &reloaded, &target).unwrap_err();
+            let error = verified_component_readback(&path, &reloaded, &target, None).unwrap_err();
             assert_eq!(
                 extract_error_kind(&error).as_deref(),
                 Some("ambiguous_target"),
                 "{corruption}"
             );
-            let preflight = component_target_from_source(&path, &reloaded.to_source(), "U1")
+            let preflight = component_target_from_source(&path, &reloaded.to_source(), "U1", None)
                 .unwrap_err()
                 .into_result();
             assert_eq!(
@@ -5856,6 +5996,113 @@ mod multi_unit_component_tests {
                 "{corruption}"
             );
         }
+    }
+
+    /// #20: a symbol carrying a second project's saved `(instances ...)`
+    /// block — the state KiCad itself leaves on a schematic file shared
+    /// across, or once standalone and now reused inside, another project —
+    /// must not be refused for that foreign block alone. Without a
+    /// structurally proven current project (`current_project: None`), nothing
+    /// here can tell "ours" from "foreign", so the old, unscoped behaviour
+    /// still refuses (`ambiguous_target`) — this is the exact case that was
+    /// wrongly refused as `stale_target`/`ambiguous_target` before the fix.
+    #[test]
+    fn foreign_project_instance_block_is_tolerated_only_when_current_project_is_proven() {
+        let (_directory, path) = fixture();
+        let mut committed = cse::Schematic::load(&path).unwrap();
+        let symbol = committed
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.reference() == Some("U1") && symbol.unit == 1)
+            .unwrap();
+        // KiCad keeps a foreign project's block untouched and adds its own —
+        // it never edits or removes what another project saved. The foreign
+        // block's reference matches this symbol's own ("U1") so the only
+        // difference from the current-project instance is the project name
+        // itself — a mismatched foreign reference is a different, already
+        // covered case (`native_readback_instance_conflicts`), and would
+        // otherwise make the unproven-ownership branch below fail on the
+        // reference check before it ever reaches the project-count check.
+        symbol.set_instance_path("isolated-inputs", "/foreign-root", "U1", 1);
+        committed.overwrite().unwrap();
+
+        let reloaded = cse::Schematic::load(&path).unwrap();
+        let symbol = reloaded
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some("U1") && symbol.unit == 1)
+            .unwrap();
+
+        // Proven current project: the foreign block is ignored, exactly as
+        // eeschema ignores it, so the call succeeds.
+        let tolerated = checked_instance_paths(&path, symbol, Some("multi")).unwrap();
+        assert_eq!(
+            tolerated,
+            vec![(
+                "multi".to_string(),
+                "/11111111-1111-4111-8111-111111111111".to_string()
+            )]
+        );
+        let target =
+            component_target_from_source(&path, &reloaded.to_source(), "U1", Some("multi"))
+                .unwrap();
+        assert!(verified_component_readback(&path, &reloaded, &target, Some("multi")).is_ok());
+
+        // Unproven ownership: no project file on disk means nothing here can
+        // tell "ours" from "foreign", so the old all-instances comparison
+        // still applies and a second project remains ambiguous.
+        let error = checked_instance_paths(&path, symbol, None)
+            .unwrap_err()
+            .into_result();
+        assert_eq!(
+            extract_error_kind(&error).as_deref(),
+            Some("ambiguous_target")
+        );
+    }
+
+    /// #20: a symbol with no current-project instance at all — every saved
+    /// block belongs to some other project — is still stale, and the message
+    /// names the eeschema remedy instead of a bare mismatch dump.
+    #[test]
+    fn missing_current_project_instance_names_the_eeschema_remedy() {
+        let (_directory, path) = fixture();
+        let mut committed = cse::Schematic::load(&path).unwrap();
+        let symbol = committed
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.reference() == Some("U1") && symbol.unit == 1)
+            .unwrap();
+        symbol
+            .raw_sub_nodes
+            .retain(|node| node.tag() != Some("instances"));
+        symbol.set_instance_path("isolated-inputs", "/foreign-root", "Q2", 1);
+        committed.overwrite().unwrap();
+
+        let reloaded = cse::Schematic::load(&path).unwrap();
+        let symbol = reloaded
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some("U1") && symbol.unit == 1)
+            .unwrap();
+        let error = checked_instance_paths(&path, symbol, Some("multi"))
+            .unwrap_err()
+            .into_result();
+        assert_eq!(extract_error_kind(&error).as_deref(), Some("stale_target"));
+        let message = body_error_message(&error);
+        assert!(
+            message.contains("open the project in eeschema and save once"),
+            "{message}"
+        );
+    }
+
+    fn body_error_message(result: &CallToolResult) -> String {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str::<serde_json::Value>(text).unwrap()["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     #[tokio::test]
@@ -6323,13 +6570,14 @@ mod multi_unit_component_tests {
     fn shared_readback_refuses_missing_or_renamed_bound_identity() {
         let (_directory, path) = fixture();
         let committed = cse::Schematic::load(&path).unwrap();
-        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1", None).unwrap();
 
         let wrong_reference = component_mutation_readback_from_schematic(
             &path,
             &committed,
             &target.uuids(),
             Some("U404"),
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -6341,6 +6589,7 @@ mod multi_unit_component_tests {
             &path,
             &committed,
             &["missing-uuid".to_owned()],
+            None,
             None,
         )
         .unwrap_err();
@@ -6357,13 +6606,14 @@ mod multi_unit_component_tests {
         std::fs::write(&other, SCHEMATIC).unwrap();
         let committed = cse::Schematic::load(&path).unwrap();
         let committed_other = cse::Schematic::load(&other).unwrap();
-        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1", None).unwrap();
 
         let wrong_document = component_mutation_readback_from_schematic(
             &path,
             &committed_other,
             &target.uuids(),
             Some("U1"),
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -6376,6 +6626,7 @@ mod multi_unit_component_tests {
             &committed,
             &target.uuids(),
             Some("U1"),
+            None,
         )
         .unwrap();
         let mismatched_field =
@@ -6390,7 +6641,7 @@ mod multi_unit_component_tests {
     fn shared_readback_reports_the_committed_models_document_path() {
         let (_directory, path) = fixture();
         let committed = cse::Schematic::load(&path).unwrap();
-        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1", None).unwrap();
         let differently_spelled = path
             .parent()
             .unwrap()
@@ -6406,6 +6657,7 @@ mod multi_unit_component_tests {
             &committed,
             &target.uuids(),
             Some("U1"),
+            None,
         )
         .unwrap();
 
@@ -6429,6 +6681,7 @@ mod multi_unit_component_tests {
             &committed,
             &[uuid.clone(), uuid.clone()],
             Some("U1"),
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -6441,9 +6694,14 @@ mod multi_unit_component_tests {
         assert_ne!(duplicate_source, SCHEMATIC);
         std::fs::write(&path, duplicate_source).unwrap();
         let committed = cse::Schematic::load(&path).unwrap();
-        let duplicate_property =
-            component_mutation_readback_from_schematic(&path, &committed, &[uuid], Some("U1"))
-                .unwrap_err();
+        let duplicate_property = component_mutation_readback_from_schematic(
+            &path,
+            &committed,
+            &[uuid],
+            Some("U1"),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             extract_error_kind(&duplicate_property).as_deref(),
             Some("ambiguous_target")
@@ -6514,7 +6772,7 @@ mod multi_unit_component_tests {
     #[test]
     fn stale_target_revision_refuses_a_prepared_component_edit() {
         let (_directory, path) = fixture();
-        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1", None).unwrap();
         let candidate = set_property_value(SCHEMATIC, "U1", "Value", "PLANNED", false)
             .unwrap()
             .0;
