@@ -4374,8 +4374,17 @@ async fn handle_set_field_position(
     };
     let unit_arg = opt_f64(args, "unit").map(|u| u as u32);
 
+    let current_project = match structurally_proven_project(&sch_path) {
+        Ok(project) => project,
+        Err(error) => return Ok(error),
+    };
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let target = match component_target_from_source(
+        &sch_path,
+        &sch.to_source(),
+        &reference,
+        current_project.as_deref(),
+    ) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -4485,7 +4494,12 @@ async fn handle_set_field_position(
     sch.overwrite()?;
 
     let committed = cse::Schematic::load(&sch_path)?;
-    let observed = match verified_component_readback(&sch_path, &committed, &target) {
+    let observed = match verified_component_readback(
+        &sch_path,
+        &committed,
+        &target,
+        current_project.as_deref(),
+    ) {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
     };
