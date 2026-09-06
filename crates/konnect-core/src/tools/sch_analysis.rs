@@ -189,6 +189,19 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic"] }),
             |args, ctx| async move { handle_check_overlaps(args, ctx).await }
         ),
+        tool!(
+            "find_duplicate_references",
+            "Walk the whole sheet hierarchy from a root schematic and report reference \
+             designators used by more than one symbol. Same reference + same lib_id + \
+             distinct unit numbers is a legitimate multi-unit component, not a duplicate; \
+             a repeated unit number, or the same reference under a different lib_id, is. \
+             Power symbols (#PWR…, #FLG…) count like any other reference. Also reports \
+             unannotated symbols (reference ending in '?') separately from duplicates.",
+            json!({ "type": "object",
+                "properties": { "schematic": { "type": "string", "description": "Root .kicad_sch to start from" } },
+                "required": ["schematic"] }),
+            |args, ctx| async move { handle_find_duplicate_references(args, ctx).await }
+        ),
     ];
     defs.extend(crate::tools::sch_layout::tools());
     defs
@@ -809,6 +822,223 @@ async fn handle_check_overlaps(
     })))
 }
 
+/// One placed symbol carrying a reference, recorded while walking the sheet
+/// tree for [`handle_find_duplicate_references`].
+struct ReferenceOccurrence {
+    sheet_path: String,
+    sheet_file: String,
+    uuid: String,
+    unit: u32,
+    lib_id: String,
+    x_mm: f64,
+    y_mm: f64,
+}
+
+impl ReferenceOccurrence {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "sheet_path": self.sheet_path,
+            "sheet_file": self.sheet_file,
+            "uuid": self.uuid,
+            "unit": self.unit,
+            "lib_id": self.lib_id,
+            "x_mm": self.x_mm,
+            "y_mm": self.y_mm,
+        })
+    }
+}
+
+async fn handle_find_duplicate_references(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let root_path = get_path(args, "schematic")?;
+    if !root_path.exists() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: root_path.display().to_string(),
+            },
+            format!("Schematic '{}' not found", root_path.display()),
+        ));
+    }
+
+    let mut by_reference: HashMap<String, Vec<ReferenceOccurrence>> = HashMap::new();
+    let mut unannotated: Vec<serde_json::Value> = Vec::new();
+    let mut symbols_scanned = 0usize;
+    let mut visited = HashSet::new();
+
+    if let Err(blocked) = walk_sheet_for_duplicate_references(
+        &root_path,
+        "/",
+        0,
+        &mut visited,
+        &mut by_reference,
+        &mut unannotated,
+        &mut symbols_scanned,
+    ) {
+        return Ok(blocked);
+    }
+
+    // A duplicate is the same reference on two symbols that are not units of
+    // one multi-unit component: same reference + same lib_id + all-distinct
+    // unit numbers is legitimate; anything else sharing the reference is a
+    // real duplicate (a repeated unit number, or a different lib_id).
+    let mut duplicates: Vec<serde_json::Value> = by_reference
+        .into_iter()
+        .filter_map(|(reference, mut occurrences)| {
+            if occurrences.len() < 2 {
+                return None;
+            }
+            let same_lib_id = occurrences
+                .iter()
+                .all(|occurrence| occurrence.lib_id == occurrences[0].lib_id);
+            let mut seen_units = HashSet::new();
+            let units_distinct = occurrences
+                .iter()
+                .all(|occurrence| seen_units.insert(occurrence.unit));
+            if same_lib_id && units_distinct {
+                return None;
+            }
+            occurrences.sort_by(|a, b| {
+                a.sheet_path
+                    .cmp(&b.sheet_path)
+                    .then_with(|| a.uuid.cmp(&b.uuid))
+            });
+            Some(json!({
+                "reference": reference,
+                "occurrences": occurrences.iter().map(ReferenceOccurrence::to_json).collect::<Vec<_>>(),
+            }))
+        })
+        .collect();
+    duplicates.sort_by(|a, b| a["reference"].as_str().cmp(&b["reference"].as_str()));
+
+    unannotated.sort_by(|a, b| {
+        let a_key = (a["sheet_path"].as_str(), a["uuid"].as_str());
+        let b_key = (b["sheet_path"].as_str(), b["uuid"].as_str());
+        a_key.cmp(&b_key)
+    });
+
+    Ok(CallToolResult::json(&json!({
+        "duplicate_count": duplicates.len(),
+        "duplicates": duplicates,
+        "unannotated_count": unannotated.len(),
+        "unannotated": unannotated,
+        "symbols_scanned_count": symbols_scanned,
+    })))
+}
+
+/// Recursively walk the sheet tree from `path`, folding every placed symbol's
+/// reference into `by_reference` (or `unannotated` for a trailing `?`).
+/// Mirrors the cycle/depth handling of `sch_hierarchy::build_hierarchy_node`
+/// (ancestor-only `visited` stack, `MAX_HIERARCHY_DEPTH` cutoff) but — unlike
+/// that tool — an unreadable file aborts the whole scan with a named `Err`
+/// instead of embedding a per-node error and continuing, per this tool's
+/// read-only "blocked, not a silent partial scan" contract.
+///
+/// Reference identity, like every other tool in this module, comes from each
+/// symbol's own `(property "Reference" ...)`, not the per-hierarchy-instance
+/// override in its `(instances ...)` block — so a sheet file genuinely reused
+/// at two hierarchy locations (KiCAD's multi-instance pattern) reads as
+/// duplicate references here, same as it would for `get_component_nets` and
+/// friends.
+#[allow(clippy::too_many_arguments)]
+fn walk_sheet_for_duplicate_references(
+    path: &std::path::Path,
+    sheet_path: &str,
+    depth: usize,
+    visited: &mut HashSet<std::path::PathBuf>,
+    by_reference: &mut HashMap<String, Vec<ReferenceOccurrence>>,
+    unannotated: &mut Vec<serde_json::Value>,
+    symbols_scanned: &mut usize,
+) -> Result<(), CallToolResult> {
+    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
+        return Ok(());
+    }
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canon.clone()) {
+        return Ok(());
+    }
+
+    let sch = cse::Schematic::load(path).map_err(|error| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: path.display().to_string(),
+            },
+            format!("Cannot read schematic '{}': {error}", path.display()),
+        )
+    })?;
+
+    for sym in sch.symbols.iter() {
+        *symbols_scanned += 1;
+        let reference = sym.reference().unwrap_or("").to_string();
+        if reference.is_empty() {
+            continue;
+        }
+        let (x, y) = sym.position();
+        if reference.ends_with('?') {
+            unannotated.push(json!({
+                "reference": reference,
+                "sheet_path": sheet_path,
+                "sheet_file": path.display().to_string(),
+                "uuid": sym.uuid,
+                "x_mm": x,
+                "y_mm": y,
+            }));
+            continue;
+        }
+        by_reference
+            .entry(reference)
+            .or_default()
+            .push(ReferenceOccurrence {
+                sheet_path: sheet_path.to_string(),
+                sheet_file: path.display().to_string(),
+                uuid: sym.uuid.clone(),
+                unit: sym.unit,
+                lib_id: sym.lib_id.clone(),
+                x_mm: x,
+                y_mm: y,
+            });
+    }
+
+    let dir = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    for sheet in sch.sheets.iter() {
+        let child_path = dir.join(sheet.file());
+        if !child_path.exists() {
+            return Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::FileNotFound {
+                    path: child_path.display().to_string(),
+                },
+                format!(
+                    "Sheet '{}' referenced from '{}' points to a missing file '{}'",
+                    sheet.name(),
+                    path.display(),
+                    child_path.display()
+                ),
+            ));
+        }
+        let child_sheet_path = if sheet_path == "/" {
+            format!("/{}", sheet.name())
+        } else {
+            format!("{sheet_path}/{}", sheet.name())
+        };
+        walk_sheet_for_duplicate_references(
+            &child_path,
+            &child_sheet_path,
+            depth + 1,
+            visited,
+            by_reference,
+            unannotated,
+            symbols_scanned,
+        )?;
+    }
+
+    visited.remove(&canon);
+    Ok(())
+}
+
 #[cfg(test)]
 mod placement_overlap_tests {
     use super::*;
@@ -1351,5 +1581,275 @@ mod multi_unit_tool_tests {
                 .any(|net| net == "HEATER_TEST"),
             "heater unit net missing: {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_reference_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn write(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn root_with_sheets(sheets: &[(&str, &str)]) -> String {
+        let sheet_blocks: String = sheets
+            .iter()
+            .enumerate()
+            .map(|(i, (name, file))| {
+                let x = 100.0 + i as f64 * 30.0;
+                format!(
+                    r#"  (sheet (at {x} 100) (size 20 20) (uuid "sheet-{i}-uuid")
+    (property "Sheetname" "{name}" (at {x} 100 0))
+    (property "Sheetfile" "{file}" (at {x} 100 0))
+  )
+"#
+                )
+            })
+            .collect();
+        format!(
+            r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root-uuid")
+{sheet_blocks})
+"#
+        )
+    }
+
+    fn symbol(reference: &str, lib_id: &str, unit: u32, uuid: &str, x: f64, y: f64) -> String {
+        format!(
+            r#"  (symbol (lib_id "{lib_id}") (at {x} {y} 0) (unit {unit}) (uuid "{uuid}")
+    (property "Reference" "{reference}" (at {x} {y} 0))
+    (property "Value" "{lib_id}" (at {x} {y} 0))
+  )
+"#
+        )
+    }
+
+    fn sheet_content(symbols: &[String]) -> String {
+        format!(
+            r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "{uuid}")
+{body})
+"#,
+            uuid = uuid::Uuid::new_v4(),
+            body = symbols.concat()
+        )
+    }
+
+    async fn call_result(schematic: &std::path::Path) -> CallToolResult {
+        let definition = tools()
+            .into_iter()
+            .find(|tool| tool.name == "find_duplicate_references")
+            .unwrap();
+        (definition.handler)(
+            &json!({ "schematic": schematic.to_str().unwrap() }),
+            Arc::new(test_ctx()),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn call(schematic: &std::path::Path) -> serde_json::Value {
+        let result = call_result(schematic).await;
+        assert!(
+            !result.is_error,
+            "find_duplicate_references failed: {result:?}"
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn same_reference_on_two_sheets_is_a_duplicate() {
+        let tmp = TempDir::new().unwrap();
+        let root = write(
+            tmp.path(),
+            "root.kicad_sch",
+            &root_with_sheets(&[
+                ("SheetA", "sheet_a.kicad_sch"),
+                ("SheetB", "sheet_b.kicad_sch"),
+            ]),
+        );
+        write(
+            tmp.path(),
+            "sheet_a.kicad_sch",
+            &sheet_content(&[symbol("R1", "Device:R", 1, "ra1", 10.0, 10.0)]),
+        );
+        write(
+            tmp.path(),
+            "sheet_b.kicad_sch",
+            &sheet_content(&[symbol("R1", "Device:R", 1, "rb1", 20.0, 20.0)]),
+        );
+
+        let body = call(&root).await;
+        assert_eq!(body["duplicate_count"], 1, "{body}");
+        assert_eq!(body["duplicates"][0]["reference"], "R1");
+        let occurrences = body["duplicates"][0]["occurrences"].as_array().unwrap();
+        assert_eq!(occurrences.len(), 2);
+        let uuids: Vec<&str> = occurrences
+            .iter()
+            .map(|o| o["uuid"].as_str().unwrap())
+            .collect();
+        assert!(
+            uuids.contains(&"ra1") && uuids.contains(&"rb1"),
+            "{occurrences:?}"
+        );
+        assert_eq!(body["symbols_scanned_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn distinct_units_of_the_same_lib_id_are_not_a_duplicate() {
+        let tmp = TempDir::new().unwrap();
+        let root = write(
+            tmp.path(),
+            "root.kicad_sch",
+            &sheet_content(&[
+                symbol("U1", "Device:Dual", 1, "u1a", 10.0, 10.0),
+                symbol("U1", "Device:Dual", 2, "u1b", 20.0, 20.0),
+            ]),
+        );
+
+        let body = call(&root).await;
+        assert_eq!(body["duplicate_count"], 0, "legitimate multi-unit: {body}");
+        assert_eq!(body["symbols_scanned_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn same_reference_and_same_unit_twice_is_a_duplicate() {
+        let tmp = TempDir::new().unwrap();
+        let root = write(
+            tmp.path(),
+            "root.kicad_sch",
+            &sheet_content(&[
+                symbol("U1", "Device:Dual", 1, "u1a", 10.0, 10.0),
+                symbol("U1", "Device:Dual", 1, "u1b", 20.0, 20.0),
+            ]),
+        );
+
+        let body = call(&root).await;
+        assert_eq!(body["duplicate_count"], 1, "repeated unit 1: {body}");
+    }
+
+    #[tokio::test]
+    async fn same_reference_different_lib_id_is_a_duplicate_even_with_distinct_units() {
+        let tmp = TempDir::new().unwrap();
+        let root = write(
+            tmp.path(),
+            "root.kicad_sch",
+            &sheet_content(&[
+                symbol("Q1", "Device:Q_NPN", 1, "q1a", 10.0, 10.0),
+                symbol("Q1", "Device:Q_PNP", 2, "q1b", 20.0, 20.0),
+            ]),
+        );
+
+        let body = call(&root).await;
+        assert_eq!(
+            body["duplicate_count"], 1,
+            "different lib_id under the same reference must not read as a multi-unit pair: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn power_symbol_references_are_checked_like_any_other() {
+        let tmp = TempDir::new().unwrap();
+        let root = write(
+            tmp.path(),
+            "root.kicad_sch",
+            &sheet_content(&[
+                symbol("#PWR1", "power:GND", 1, "pwr1a", 10.0, 10.0),
+                symbol("#PWR1", "power:GND", 1, "pwr1b", 20.0, 20.0),
+            ]),
+        );
+
+        let body = call(&root).await;
+        assert_eq!(body["duplicate_count"], 1, "{body}");
+        assert_eq!(body["duplicates"][0]["reference"], "#PWR1");
+    }
+
+    #[tokio::test]
+    async fn unannotated_reference_is_reported_separately_from_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let root = write(
+            tmp.path(),
+            "root.kicad_sch",
+            &sheet_content(&[
+                symbol("R?", "Device:R", 1, "rq1", 10.0, 10.0),
+                symbol("R?", "Device:R", 1, "rq2", 20.0, 20.0),
+            ]),
+        );
+
+        let body = call(&root).await;
+        assert_eq!(
+            body["duplicate_count"], 0,
+            "unannotated refs are not duplicate candidates: {body}"
+        );
+        assert_eq!(body["unannotated_count"], 2, "{body}");
+        let refs: Vec<&str> = body["unannotated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["reference"].as_str().unwrap())
+            .collect();
+        assert!(refs.iter().all(|r| *r == "R?"), "{refs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_child_sheet_file_is_a_named_blocked_result() {
+        let tmp = TempDir::new().unwrap();
+        let root = write(
+            tmp.path(),
+            "root.kicad_sch",
+            &root_with_sheets(&[("Gone", "gone.kicad_sch")]),
+        );
+        // Deliberately do not create gone.kicad_sch.
+
+        let result = call_result(&root).await;
+        assert!(
+            result.is_error,
+            "missing sheet file must block, not partial-scan"
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(
+            text.contains("gone.kicad_sch"),
+            "blocked result must name the missing file: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_schematic_is_a_named_blocked_result() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("missing.kicad_sch");
+
+        let result = call_result(&missing).await;
+        assert!(result.is_error);
     }
 }

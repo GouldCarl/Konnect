@@ -152,6 +152,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 | `check_schematic_layout` | Lint drawing quality: off-page items, text overlapping other text/a symbol body/a sheet, crowded or overlapping symbols, wires through a symbol body or text, fields drifting from their symbol, malformed sheet pins, a library pin meeting its body at a corner, duplicate labels, and off-centre content. Uses kicad-cli's SVG export for exact text extents; reports `BLOCKED`, never a silent pass, when it cannot. |
+| `find_duplicate_references` | Walk the whole sheet hierarchy and report reference designators used by more than one symbol (distinct units of one multi-unit component excepted), plus unannotated ('?') references. |
 
 ### `sch_batch` · 12 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
