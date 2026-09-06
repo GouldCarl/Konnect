@@ -36,7 +36,10 @@ Load additional toolsets as needed:
 load_toolset('library')          # search_symbols, get_symbol_info, list_symbol_libraries
 ```
 
-Always call `get_active_toolsets()` first to see what is already loaded.
+Always call `get_active_toolsets()` first to see what is already loaded, and call
+`get_installation_info()` once per session to record which build, binary path and KiCad CLI are
+serving the calls — every version reports the same tool names, so this is the only way to know
+which Konnect produced a result.
 
 ---
 
