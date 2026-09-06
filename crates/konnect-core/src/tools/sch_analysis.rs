@@ -517,7 +517,10 @@ async fn handle_find_orphan_items(
     }
 
     // Report the unconnected pins promised by the tool description. A pin
-    // sitting mid-wire connects only through a junction dot (#104).
+    // sitting mid-wire connects only through a junction dot sitting exactly
+    // on it (#104, #13-followup) — `attaches_pin` checks that at
+    // `EXACT_TOLERANCE`, tighter than the `tolerance` this index was built
+    // with, so a nearby-but-not-coincident dot still reads as unconnected.
     for placed in index.placed_pins() {
         let (x, y) = placed.at;
         if placed.pin.electrical_type == "no_connect" || index.has_no_connect(x, y) {
