@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **20 toolsets** organized into 10 categories
-- **221 registered tools** + **7 always-visible meta-tools** = **228 total**
+- **224 registered tools** + **7 always-visible meta-tools** = **231 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -171,7 +171,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Preserves every saved hierarchy instance and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
 
-### `sch_export` · 10 tools
+### `sch_export` · 13 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
 **Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
 
@@ -181,9 +181,12 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `render_schematic_png` | Render a sheet to PNG: kicad-cli SVG rasterized in-process with deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds base64 content so the caller can inspect its own output. |
 | `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
+| `set_connectivity_baseline` | Export the schematic's netlist (kicad-cli kicadsexpr) and store it as the sheet's connectivity baseline under `.konnect/baselines/`, beside the visual baseline, recording the source file hash. |
+| `compare_connectivity_baseline` | Re-export the netlist and compare its pin partition against the stored connectivity baseline (same semantics as `compare_netlists`). "No baseline stored" is an explicit result; a kicad-cli export failure is an explicit "blocked" result, not a silent pass. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
+| `compare_netlists` | Compare two kicad-cli kicadsexpr netlist exports by how they partition component pins into nets — net names ignored. Reports whether the partitions are identical, and when not, nets that split, nets that merged, individual pins that moved to an unrelated net, and pins present in only one of the two files. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. |

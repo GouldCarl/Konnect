@@ -10,6 +10,7 @@ mod footprint_models;
 pub mod integration;
 pub mod library;
 pub mod manufacturing;
+pub(crate) mod netlist_diff;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
