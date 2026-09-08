@@ -16,13 +16,22 @@ pub fn format_blank_schematic() -> String {
     format_blank_schematic_with_paper("A4", false)
 }
 
+/// The file-format epoch KiCad 10 writes.
+///
+/// This is the `(version ...)` date in the s-expression, not the application version --
+/// `generator_version` carries that.  They are easy to conflate and the consequence is
+/// visible to the user: a file stamped with an older epoch opens with KiCad's "created in
+/// an earlier version" notice even though every field in it is current.  Sheets Konnect
+/// creates should look no different from ones eeschema created.
+const KICAD_SCH_FORMAT: u32 = 20260306;
+
 /// Same, on the given KiCad paper size. The caller validates the name: an
 /// unknown one makes KiCad reject the file.
 #[must_use]
 pub fn format_blank_schematic_with_paper(size: &str, portrait: bool) -> String {
     let orientation = if portrait { " portrait" } else { "" };
     format!(
-        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"{size}\"{orientation})\n\t(lib_symbols\n\t)\n)\n",
+        "(kicad_sch\n\t(version {KICAD_SCH_FORMAT})\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"{size}\"{orientation})\n\t(lib_symbols\n\t)\n)\n",
         crate::writer::new_uuid()
     )
 }
@@ -1654,5 +1663,23 @@ mod pin_label_rotation_tests {
         assert_eq!(horizontal_label_rotation(90.0), 0.0);
         assert_eq!(horizontal_label_rotation(270.0), 0.0);
         assert_eq!(horizontal_label_rotation(-180.0), 180.0);
+    }
+}
+
+#[cfg(test)]
+mod blank_schematic_tests {
+    use super::*;
+
+    /// KiCad decides whether to warn "created in an earlier version" from the file-format
+    /// epoch, not from `generator_version`, so a sheet Konnect creates has to carry the same
+    /// epoch eeschema writes or every project made with it opens with that notice.
+    #[test]
+    fn a_blank_schematic_carries_the_kicad_10_format_epoch() {
+        let s = format_blank_schematic();
+        assert!(
+            s.contains("(version 20260306)"),
+            "blank schematic is not stamped with the KiCad 10 epoch: {s}"
+        );
+        assert!(s.contains("(generator_version \"10.0\")"));
     }
 }
