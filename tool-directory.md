@@ -375,7 +375,7 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `download_jlcpcb_database` | Download or update the local JLCPCB parts database cache (SQLite). |
-| `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. |
+| `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. The query is split on whitespace; a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive, `%` and `_` literal). |
 | `get_jlcpcb_part` | Retrieve full details for a single JLCPCB part by LCSC part number. |
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked alternatives for a given component value and footprint. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |

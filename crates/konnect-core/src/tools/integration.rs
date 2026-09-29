@@ -56,11 +56,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "search_jlcpcb_parts",
-            "Search the local JLCPCB component database by keyword, value, or category.",
+            "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive.",
             json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search string (MPN, description, or value)" },
+                    "query": { "type": "string", "description": "Search words, separated by spaces. A part must contain every word, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive; % and _ are literal)" },
                     "category": { "type": "string", "description": "Component category filter (optional)" },
                     "basic_only": { "type": "boolean", "description": "Restrict to JLCPCB Basic Library parts only", "default": false },
                     "in_stock": { "type": "boolean", "description": "Only return parts currently in stock", "default": true },
@@ -551,6 +551,17 @@ fn cache_key(tool: &str, db_path: &std::path::Path, parts: &[&str]) -> String {
     format!("{}|{}|{}", tool, db_path.display(), parts.join("|"))
 }
 
+/// Columns `search_jlcpcb_parts` matches every query word against, in the
+/// order they appear in the SQL and in the response's `search_fields`.
+const JLCPCB_SEARCH_FIELDS: [&str; 5] =
+    ["Description", "MFR_Part", "LCSC", "Package", "Manufacturer"];
+
+/// The query words a part must all contain: the single source for both the
+/// SQL and the `tokens` evidence in the response.
+fn jlcpcb_search_tokens(query: &str) -> Vec<String> {
+    query.split_whitespace().map(String::from).collect()
+}
+
 async fn handle_search_jlcpcb_parts(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -592,39 +603,53 @@ async fn handle_search_jlcpcb_parts(
         return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
     }
 
+    let tokens = jlcpcb_search_tokens(&query);
+    let sql_tokens = tokens.clone();
     let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = rusqlite::Connection::open(&db_path)?;
 
         // The JLCPCB db schema has columns: LCSC, MFR_Part, Package, Solder_Joint,
         // Manufacturer, Library_Type, Description, Datasheet, Price, Stock
+        //
+        // Every whitespace-separated word must match somewhere in one of
+        // the searchable columns, in any order (#432). `%`, `_` and `\` in a
+        // word are matched literally, and every value is a bound parameter.
         let mut sql = String::from(
             "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
-             FROM components WHERE (Description LIKE ?1 OR MFR_Part LIKE ?1)"
+             FROM components WHERE 1=1",
         );
+        let mut params: Vec<String> = Vec::new();
+        for token in &sql_tokens {
+            let escaped = token
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            params.push(format!("%{}%", escaped));
+            let n = params.len();
+            sql.push_str(&format!(
+                " AND (Description LIKE ?{n} ESCAPE '\\' OR MFR_Part LIKE ?{n} ESCAPE '\\' \
+                 OR LCSC LIKE ?{n} ESCAPE '\\' OR Package LIKE ?{n} ESCAPE '\\' \
+                 OR Manufacturer LIKE ?{n} ESCAPE '\\')"
+            ));
+        }
         if basic_only {
             sql.push_str(" AND Library_Type = 'Basic'");
         }
         if in_stock {
             sql.push_str(" AND Stock > 0");
         }
-        if let Some(ref _cat) = category {
-            sql.push_str(" AND Category LIKE ?2");
+        if let Some(ref cat) = category {
+            params.push(format!("%{}%", cat));
+            sql.push_str(&format!(" AND Category LIKE ?{}", params.len()));
         }
-        sql.push_str(&format!(" LIMIT {}", limit));
+        // Stable order so a LIMIT page is the same on every run (#432).
+        sql.push_str(&format!(" ORDER BY LCSC LIMIT {}", limit));
 
-        let like_query = format!("%{}%", query);
         let mut stmt = conn.prepare(&sql)?;
-
-        let rows: Vec<serde_json::Value> = if category.is_some() {
-            let cat_like = format!("%{}%", category.as_deref().unwrap_or(""));
-            stmt.query_map(rusqlite::params![like_query, cat_like], row_to_part_json)?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map(rusqlite::params![like_query], row_to_part_json)?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), row_to_part_json)?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(rows)
     })
     .await??;
@@ -632,7 +657,9 @@ async fn handle_search_jlcpcb_parts(
     let body = json!({
         "query": args["query"].as_str().unwrap_or(""),
         "count": results.len(),
-        "results": results
+        "results": results,
+        "tokens": tokens,
+        "search_fields": JLCPCB_SEARCH_FIELDS
     });
     ctx.jlcpcb_cache.put(key, body.clone());
 
@@ -2290,6 +2317,180 @@ mod jlcpcb_cache_tests {
         assert_eq!(response_json(&second)["cached"], json!(true));
     }
 
+    /// Seeds parts whose search words are spread over different columns.
+    fn seed_multi_word_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, db_path) = seed_test_db();
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        for (lcsc, mpn, package, mfr, desc) in [
+            (
+                "C1001",
+                "PH-1x7",
+                "2.54mm",
+                "BOOMELE",
+                "Pin Header 1x7 Through Hole Male",
+            ),
+            (
+                "C1002",
+                "PH-1x40",
+                "2.54mm",
+                "BOOMELE",
+                "40P Pin Header Through Hole",
+            ),
+            (
+                "C1003",
+                "CAP-50",
+                "0603",
+                "Samsung",
+                "50% duty_cycle capacitor",
+            ),
+            (
+                "C1004",
+                "CAP-51",
+                "0603",
+                "Samsung",
+                "50 duty cycle capacitor",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, ?2, ?3, ?4, 'Extended', ?5, '', 0.1, 10, 'Misc')",
+                rusqlite::params![lcsc, mpn, package, mfr, desc],
+            )
+            .unwrap();
+        }
+        (dir, db_path)
+    }
+
+    async fn search_lcsc_ids(db_path: &std::path::Path, query: &str) -> Vec<String> {
+        let ctx = test_ctx();
+        let args = json!({ "query": query, "output_path": db_path.to_str().unwrap() });
+        let result = handle_search_jlcpcb_parts(&args, &ctx).await.unwrap();
+        let mut ids: Vec<String> = response_json(&result)["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["lcsc"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The defect in #432: the whole query was bound as one `LIKE '%query%'`
+    /// phrase against Description/MFR_Part, so reordering, trimming or adding
+    /// a word that is not in that exact order flipped a hit into zero results.
+    #[tokio::test]
+    async fn search_jlcpcb_parts_matches_every_token_in_any_order() {
+        let (_dir, db_path) = seed_multi_word_db();
+        assert_eq!(
+            search_lcsc_ids(&db_path, "Pin Header 1x7").await,
+            vec!["C1001"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "  1x7   header pin ").await,
+            vec!["C1001"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "through hole pin header").await,
+            vec!["C1001", "C1002"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "40P Pin Header Through Hole").await,
+            vec!["C1002"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_jlcpcb_parts_tokens_may_span_columns() {
+        let (_dir, db_path) = seed_multi_word_db();
+        // Package, Manufacturer, LCSC and MFR_Part are all searchable.
+        assert_eq!(
+            search_lcsc_ids(&db_path, "boomele 2.54mm 1x7").await,
+            vec!["C1001"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "C1002 header").await,
+            vec!["C1002"]
+        );
+        assert_eq!(
+            search_lcsc_ids(&db_path, "PH-1x40 boomele").await,
+            vec!["C1002"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_jlcpcb_parts_absent_token_returns_no_row() {
+        let (_dir, db_path) = seed_multi_word_db();
+        assert!(search_lcsc_ids(&db_path, "pin header 1x7 nonexistentword")
+            .await
+            .is_empty());
+    }
+
+    /// The filters and LIMIT keep working alongside the tokenised match.
+    /// (The query has no ORDER BY, before or after the fix.)
+    #[tokio::test]
+    async fn search_jlcpcb_parts_preserves_stock_basic_category_and_limit_filters() {
+        let (_dir, db_path) = seed_multi_word_db();
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        for (lcsc, lib, desc, stock, cat) in [
+            ("C2001", "Basic", "Widget gadget alpha", 10, "Gadgets"),
+            ("C2002", "Extended", "Widget gadget beta", 10, "Gadgets"),
+            ("C2003", "Basic", "Widget gadget gamma", 0, "Gadgets"),
+            ("C2004", "Basic", "Widget gadget delta", 10, "Other"),
+        ] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'MPN', 'PKG', 'MFR', ?2, ?3, '', 0.1, ?4, ?5)",
+                rusqlite::params![lcsc, lib, desc, stock, cat],
+            )
+            .unwrap();
+        }
+        let ctx = test_ctx();
+        let run = |extra: serde_json::Value| {
+            let mut args =
+                json!({ "query": "gadget widget", "output_path": db_path.to_str().unwrap() });
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            let ctx = &ctx;
+            async move {
+                let result = handle_search_jlcpcb_parts(&args, ctx).await.unwrap();
+                let mut ids: Vec<String> = response_json(&result)["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["lcsc"].as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        // in_stock defaults to true: C2003 (stock 0) is excluded.
+        assert_eq!(run(json!({})).await, vec!["C2001", "C2002", "C2004"]);
+        assert_eq!(
+            run(json!({ "in_stock": false })).await,
+            vec!["C2001", "C2002", "C2003", "C2004"]
+        );
+        assert_eq!(
+            run(json!({ "basic_only": true })).await,
+            vec!["C2001", "C2004"]
+        );
+        assert_eq!(
+            run(json!({ "category": "Gadgets" })).await,
+            vec!["C2001", "C2002"]
+        );
+        assert_eq!(
+            run(json!({ "category": "Gadgets", "basic_only": true, "in_stock": false })).await,
+            vec!["C2001", "C2003"]
+        );
+        assert_eq!(run(json!({ "limit": 2 })).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_jlcpcb_parts_like_metacharacters_are_literal() {
+        let (_dir, db_path) = seed_multi_word_db();
+        assert_eq!(search_lcsc_ids(&db_path, "50%").await, vec!["C1003"]);
+        assert_eq!(search_lcsc_ids(&db_path, "duty_cycle").await, vec!["C1003"]);
+        assert!(search_lcsc_ids(&db_path, "%").await.len() == 1);
+    }
+
     fn response_json(result: &CallToolResult) -> serde_json::Value {
         match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
@@ -2358,6 +2559,86 @@ mod jlcpcb_cache_tests {
             response_json(&search)["results"][0]["datasheet_url"],
             json!("https://www.lcsc.com/datasheet/C14663.pdf")
         );
+    }
+
+    #[tokio::test]
+    async fn search_jlcpcb_parts_limit_page_is_ordered_by_lcsc() {
+        let (_dir, db_path) = seed_multi_word_db();
+        let ctx = test_ctx();
+        // Insert out of LCSC order so rowid order differs from LCSC order.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for lcsc in ["C3003", "C3001", "C3002"] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, 'ORD-1', '0805', 'Acme', 'Basic', 'ordercheck part', '', 0.1, 10, 'Misc')",
+                rusqlite::params![lcsc],
+            )
+            .unwrap();
+        }
+        let args = json!({
+            "query": "ordercheck",
+            "limit": 2,
+            "output_path": db_path.to_str().unwrap()
+        });
+        let body = response_json(&handle_search_jlcpcb_parts(&args, &ctx).await.unwrap());
+        let ids: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["lcsc"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["C3001", "C3002"]);
+    }
+
+    #[tokio::test]
+    async fn served_tools_call_reports_tokens_and_fields_on_miss_and_cache_hit() {
+        let (_dir, db_path) = seed_multi_word_db();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: Some(db_path.clone()),
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let call = || async {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_jlcpcb_parts",
+                        "arguments": {
+                            "query": "  header   Pin 1x7 ",
+                            "limit": 5
+                        }
+                    }
+                }))
+                .await
+                .expect("response");
+            let result = response.result.expect("result");
+            serde_json::from_str::<serde_json::Value>(
+                result["content"][0]["text"].as_str().expect("text"),
+            )
+            .expect("json body")
+        };
+        let fresh = call().await;
+        let hit = call().await;
+        assert_eq!(fresh["cached"], json!(false));
+        assert_eq!(hit["cached"], json!(true));
+        for body in [&fresh, &hit] {
+            assert_eq!(body["tokens"], json!(["header", "Pin", "1x7"]));
+            assert_eq!(
+                body["search_fields"],
+                json!(["Description", "MFR_Part", "LCSC", "Package", "Manufacturer"])
+            );
+            assert_eq!(body["query"], json!("  header   Pin 1x7 "));
+        }
+        assert_eq!(fresh["results"], hit["results"]);
+        assert!(fresh["count"].as_u64().unwrap() >= 1);
     }
 
     /// With no database at all the tool degrades to its old behaviour — web
