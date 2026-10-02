@@ -2,6 +2,7 @@
 //!
 //! Drives the shipped binary over stdio through a full design loop:
 //! create project → place components → wire → ERC → export Gerbers → DRC.
+//! Also checks selected-layer PCB SVG export through the same MCP boundary.
 //!
 //! Requires kicad-cli and the standard symbol libraries, so it is `#[ignore]`
 //! by default and run explicitly by the e2e-kicad workflow (and locally):
@@ -136,6 +137,55 @@ impl Drop for Mcp {
 fn body(result: &Value) -> Value {
     serde_json::from_str(result["content"][0]["text"].as_str().unwrap_or("{}"))
         .unwrap_or(Value::Null)
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn selected_layer_pcb_svg_export_through_mcp() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
+    };
+    // KiCad 10-reserialized fixture with a board-owned F.SilkS line and an
+    // Edge.Cuts outline; see its README for the source and geometry.
+    let board = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/drc_ownership_j1.kicad_pcb");
+    let dir = tempfile::tempdir().unwrap();
+    let both_path = dir.path().join("silk-and-edge.svg");
+    let silk_path = dir.path().join("silk-only.svg");
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.load("pcb_export");
+
+    let both = body(&mcp.tool(
+        "export_svg",
+        json!({
+            "board": board.to_string_lossy(),
+            "output": both_path.to_string_lossy(),
+            "layers": ["F.SilkS", "Edge.Cuts"]
+        }),
+    ));
+    assert_eq!(both["success"], true, "{both}");
+    let both_svg = std::fs::read_to_string(&both_path)
+        .expect("selected-layer SVG was not written")
+        .replace("\r\n", "\n");
+    assert!(both_svg.contains("<svg") && both_svg.contains("</svg>"));
+    assert!(both_svg.contains("M125.0000 60.0000\nL135.0000 60.0000"));
+    assert!(both_svg.contains("M120.0000 56.5000\nL160.0000 56.5000"));
+
+    let silk = body(&mcp.tool(
+        "export_svg",
+        json!({
+            "board": board.to_string_lossy(),
+            "output": silk_path.to_string_lossy(),
+            "layers": ["F.SilkS"]
+        }),
+    ));
+    assert_eq!(silk["success"], true, "{silk}");
+    let silk_svg = std::fs::read_to_string(&silk_path)
+        .expect("silkscreen SVG was not written")
+        .replace("\r\n", "\n");
+    assert!(silk_svg.contains("<svg") && silk_svg.contains("</svg>"));
+    assert!(silk_svg.contains("M125.0000 60.0000\nL135.0000 60.0000"));
+    assert!(!silk_svg.contains("M120.0000 56.5000\nL160.0000 56.5000"));
 }
 
 #[test]
