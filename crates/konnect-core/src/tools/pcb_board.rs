@@ -264,8 +264,10 @@ impl NoLiveBoard {
 /// * A file-only edit is invisible to a KiCAD holding this board open and is
 ///   discarded by its next save. So the fallback gate is the typed transport
 ///   classification, never a text match. A KiCad that answers — even with an
-///   error — fails closed. An unreachable transport permits the file path only
-///   when this server has never observed the requested board live.
+///   error — fails closed unless it proves this board is not open. An unreachable
+///   transport permits the file path when this server has never observed the
+///   board live, or when a previously observed exact-board lock has vanished
+///   after a clean editor close.
 /// * A reachable KiCAD that does not hold this board is a third answer, not a
 ///   refusal: it has no unsaved state for a board it never opened, so the file
 ///   is authoritative and the edit proceeds there.
@@ -402,8 +404,8 @@ fn board_lock_refusal_from(
 /// (#192). For tools with no IPC implementation this guard is the honest
 /// alternative to [`attempt_ipc_write`]'s fallback. A reachable KiCAD holding
 /// a *different* board (or none) does not interfere with this file. An
-/// unreachable transport proceeds only when this server has never observed
-/// the requested board live.
+/// unreachable transport also proceeds after shared board-session evidence
+/// proves a clean close of this previously observed board.
 pub(crate) async fn refuse_if_board_open_in_kicad(
     ctx: &ToolContext,
     board_path: &std::path::Path,

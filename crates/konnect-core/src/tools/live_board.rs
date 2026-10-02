@@ -8,8 +8,9 @@
 //!
 //! This module owns that reading, and in particular the rule with the worst
 //! failure mode in the codebase: a board this process watched KiCad hold is
-//! never treated as safely absent afterwards, however KiCad stops answering
-//! (#240). A gate that maps [`LiveBoard`] cannot forget it by omission.
+//! treated as safely absent afterwards only with exact-board clean-close lock
+//! evidence (#240, #671). A gate that maps [`LiveBoard`] cannot forget that
+//! evidence requirement by omission.
 
 use std::path::Path;
 
@@ -57,8 +58,8 @@ pub(crate) enum LiveBoard<T> {
     /// or unreadable open-document list, or a document bound earlier that is
     /// no longer uniquely open.
     Unresolved(konnect_ipc::BoardTargetError),
-    /// The request never reached a KiCad, and this process never saw one hold
-    /// this board. Carries the transport failure.
+    /// The request did not reach KiCad, and no unreleased live observation
+    /// remains for this board. Carries the transport failure.
     NeverReached(String),
     /// This process watched KiCad hold this board, and can no longer reach it
     /// — unreachable transport, or an editor that closed the board. The saved
@@ -70,8 +71,8 @@ pub(crate) enum LiveBoard<T> {
         /// The situation in prose, for the refusal each gate words itself.
         situation: &'static str,
         /// The transport went away, rather than KiCad answering that it no
-        /// longer holds the board. Only then can a sibling lock be the better
-        /// evidence, so only then do the write gates consult one.
+        /// longer holds the board. Write gates use this to prefer the lock
+        /// diagnostic when transport loss and a remaining lock coincide.
         ipc_unreachable: bool,
     },
 }
@@ -112,14 +113,13 @@ where
     // mid-call leaves a transport failure that only this read can recognise as
     // a loss. Sampling beforehand called it a cold start, and let the saved
     // file answer for a board KiCad had just proven it was holding.
-    let observed_live = ctx.board_session.was_observed_live(board_path);
 
     Ok(match failure {
         konnect_ipc::IpcFailure::Rejected(message) => LiveBoard::Rejected(message),
         konnect_ipc::IpcFailure::Uncertain(message) => LiveBoard::Uncertain(message),
         konnect_ipc::IpcFailure::Recovered(message) => LiveBoard::Recovered(message),
         konnect_ipc::IpcFailure::Target { error, message } if error.proves_not_open() => {
-            if observed_live {
+            if !ctx.board_session.authorize_file_fallback(board_path) {
                 LiveBoard::LostAfterObservation {
                     situation: "Konnect previously reached KiCad with this board open, and KiCad \
                                 no longer has it open.",
@@ -131,7 +131,7 @@ where
         }
         konnect_ipc::IpcFailure::Target { error, .. } => LiveBoard::Unresolved(error),
         konnect_ipc::IpcFailure::Unreachable(message) => {
-            if observed_live {
+            if !ctx.board_session.authorize_file_fallback(board_path) {
                 LiveBoard::LostAfterObservation {
                     situation: "Konnect previously reached KiCad with this board open, but IPC is \
                                 now unreachable.",
@@ -180,6 +180,62 @@ pub(crate) fn editor_lock_with(
 mod tests {
     use super::*;
     use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+
+    /// Exercise the shared classification through every consumer, independently:
+    /// one successful gate must not hide a missing recovery path in another.
+    #[tokio::test]
+    async fn clean_close_recovers_with_unreachable_ipc() {
+        clean_close_recovers_consumers(String::new()).await;
+    }
+
+    #[tokio::test]
+    async fn clean_close_recovers_when_kicad_reports_the_board_not_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let server = spawn_kicad_holding_board(&other, |_| None);
+        clean_close_recovers_consumers(server.address().to_string()).await;
+    }
+
+    async fn clean_close_recovers_consumers(endpoint: String) {
+        use crate::tools::board_source::{read_board, BoardRead, BoardSource};
+        use crate::tools::pcb_board::{
+            attempt_ipc_write, refuse_if_board_open_in_kicad, BoardWrite,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let requested = board(dir.path());
+        for consumer in 0..4 {
+            let ctx = ctx_talking_to(endpoint.clone());
+            let lock = konnect_sexp::writer::kicad_editor_lock_path(&requested).unwrap();
+            std::fs::write(&lock, "lock").unwrap();
+            ctx.board_session.observe_live(&requested);
+            std::fs::remove_file(&lock).unwrap();
+            match consumer {
+                0 => assert!(matches!(
+                    attempt_ipc_write(&ctx, &requested, "test", |_| Ok(()))
+                        .await
+                        .unwrap(),
+                    BoardWrite::File(_)
+                )),
+                1 => assert!(refuse_if_board_open_in_kicad(&ctx, &requested, "test")
+                    .await
+                    .unwrap()
+                    .is_none()),
+                2 => assert!(matches!(
+                    read_board(&ctx, &requested, BoardSource::Auto, "test", |_, _| Ok(()))
+                        .await
+                        .unwrap(),
+                    BoardRead::Saved(_)
+                )),
+                _ => assert!(matches!(
+                    read_board(&ctx, &requested, BoardSource::Live, "test", |_, _| Ok(()))
+                        .await
+                        .unwrap(),
+                    BoardRead::Refused(_)
+                )),
+            }
+        }
+    }
 
     /// KiCad proves it holds the board, and the editor is gone by the time the
     /// next command dials. Every `send_command` opens its own socket, and
