@@ -4070,6 +4070,83 @@ mod bulk_move_field_tests {
 }
 
 #[cfg(test)]
+mod bulk_move_coordinate_text_tests {
+    use super::*;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    const SCH: &str = include_str!("../../tests/fixtures/single_pin_nets.kicad_sch");
+
+    /// #744: the snapped grid point is written as KiCad writes it. 132 × 1.27
+    /// is `167.64000000000001` in `f64`, 110 × 1.27 is exactly `139.7`, so
+    /// `#PWR002` exposed the noise and `R8` is the control. Expected text is
+    /// what `kicad-cli sch upgrade --force` writes for the moved sheet.
+    #[tokio::test]
+    async fn bulk_move_writes_kicad_coordinate_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("move.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_bulk_move(
+            &json!({ "schematic": path.to_str().unwrap(),
+                     "references": ["#PWR002", "R8"], "dx": -5.08, "dy": 0.0 }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        // The symbol's own (at …), the first in its block; its fields share
+        // the same point and already went through `fmt_f64`.
+        let symbol_at = |reference: &str| {
+            let (start, end) = find_all_symbol_instance_blocks(&after, reference)[0];
+            let block = &after[start..end];
+            let at = block.find("(at ").unwrap();
+            block[at..at + block[at..].find(')').unwrap() + 1].to_string()
+        };
+        assert_eq!(symbol_at("#PWR002"), "(at 45.72 167.64 0)");
+        assert_eq!(symbol_at("R8"), "(at 54.61 139.7 90)");
+        // KiCad never writes more than six decimals.
+        let noisy: Vec<&str> = after
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+            .filter(|token| token.parse::<f64>().is_ok())
+            .filter(|token| {
+                token
+                    .split_once('.')
+                    .is_some_and(|(_, frac)| frac.len() > 6)
+            })
+            .collect();
+        assert!(noisy.is_empty(), "unrounded coordinates written: {noisy:?}");
+
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let placement = |reference: &str| {
+            body["moved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["reference"] == reference)
+                .unwrap()["placements"][0]
+                .clone()
+        };
+        assert_eq!(
+            placement("#PWR002"),
+            json!({ "old_x": 50.8, "old_y": 167.64, "new_x": 45.72, "new_y": 167.64 })
+        );
+        assert_eq!(
+            placement("R8"),
+            json!({ "old_x": 59.69, "old_y": 139.7, "new_x": 54.61, "new_y": 139.7 })
+        );
+    }
+}
+
+#[cfg(test)]
 mod power_symbol_connection_tests {
     use super::*;
     use crate::tools::{ServerConfig, ToolContext};
