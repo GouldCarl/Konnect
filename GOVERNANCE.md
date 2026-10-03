@@ -37,6 +37,14 @@ independent.
   approving-review count is required, but review is still a real decision:
   every conversation must be resolved and the exact current head must satisfy
   the issue, evidence, and queue requirements below.
+- **PRs authored by `@mixelpixx` or `@neusse` carry standing merge
+  authorization once they satisfy that readiness gate.** The queue maintainer
+  does not wait for an additional per-PR or per-head approval. After each such
+  merge, synchronize `main`, verify the result, recompute the immediate queue,
+  and continue through consecutive ready PRs by either maintainer. Stop before
+  the first next-to-land PR authored by anyone else and obtain explicit
+  maintainer authorization for that exact head; do not skip it merely to reach
+  a maintainer-authored PR later in the queue.
 - **Merge commits only** (`gh pr merge N --merge`), so authorship survives.
 - **The active `main: CI must pass` ruleset is the protection source of truth.**
   It requires pull requests, all ten CI checks, and resolved review threads;
@@ -70,7 +78,10 @@ independent.
   completed exact-head review as a GitHub comment review when reviewing someone
   else's PR; the one `status:*` label still names the next actor. For their own
   PR, where GitHub does not permit self-review, the maintainer records the
-  assessment in an ordinary PR comment. Neither record is merge permission.
+  assessment in an ordinary PR comment. The record establishes review, not
+  authorization: maintainer-authored PRs use the standing authorization above,
+  while every other author's PR needs explicit maintainer authorization for the
+  exact ready head.
   After a completed review, a maintainer may clear a stale automatic CODEOWNERS
   request only when that owner has no specific decision pending. Preserve
   explicit review requests, requested changes, and owner decisions about scope,
@@ -96,7 +107,10 @@ independent.
 5. When the PR is genuinely merge-ready, replace its workflow-state label with
    `status:ready-to-merge`. If checks are still running, arm GitHub auto-merge
    with the **merge commit** method. If every requirement is already green,
-   merge with `gh pr merge N --merge` after the same final verification.
+   merge with `gh pr merge N --merge` after the same final verification. For a
+   PR authored by `@mixelpixx` or `@neusse`, standing authorization applies;
+   otherwise record explicit maintainer authorization for that exact head
+   before executing the merge.
 6. Any new commit, force-push, base change, required-check regression, or newly
    unresolved conversation invalidates the readiness decision. Return the PR to
    the appropriate state, review the new exact head, and arm it again only after
@@ -104,9 +118,11 @@ independent.
    fork contributor pushes; that is expected safety behavior.
 7. After merge, synchronize local `main`, verify the merge commit, terminal
    issue closure, and acceptance evidence, then promote only the next PR in the
-   documented dependency order. Run the complete local gate above only when
-   one of its explicit conditions applies. GitHub deletes the merged topic
-   branch automatically.
+   documented dependency order. Continue automatically while that immediate
+   successor is ready and authored by `@mixelpixx` or `@neusse`; stop at the
+   first other author, blocker, or end of the queue. Run the complete local gate
+   above only when one of its explicit conditions applies. GitHub deletes the
+   merged topic branch automatically.
 
 ## Claiming work
 
