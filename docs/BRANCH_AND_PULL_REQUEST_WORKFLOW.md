@@ -235,14 +235,18 @@ For the one next-to-land PR in an overlap set:
 2. A maintainer verifies the head SHA, focused diff, dependency position,
    issue-closing references, evidence, and every resolved review conversation.
 3. If something remains, the maintainer applies the label for the actual next
-   actor and leaves auto-merge off.
+   actor and leaves auto-merge off. A substantive review finding always means
+   `status:waiting-on-author`, including on a PR authored by `@mixelpixx` or
+   `@neusse`. Record one complete actionable review and stop processing that PR.
+   Do not silently patch another maintainer's PR and merge it in the same review
+   pass unless explicitly asked to take over that specific finding.
 4. If the PR is ready but required checks are still running, the maintainer
    applies `status:ready-to-merge` and enables auto-merge with the merge-commit
    method. If all requirements are already satisfied, the maintainer may merge
    immediately with `gh pr merge N --merge` after the same verification. A PR
    authored by `@mixelpixx` or `@neusse` has standing merge authorization once
-   this exact-head gate is satisfied; any other author's PR requires explicit
-   maintainer authorization for that exact head.
+   this exact-head gate is satisfied with no unresolved findings; any other
+   author's PR requires explicit maintainer authorization for that exact head.
 5. A new commit, rewritten head, base change, failed or missing required check,
    or unresolved conversation returns the PR to review. Recheck the new exact
    head before arming auto-merge again.
