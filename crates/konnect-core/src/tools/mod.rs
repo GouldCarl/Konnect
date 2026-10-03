@@ -1,5 +1,7 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+#[cfg(test)]
+mod board_extents_tests;
 mod board_session;
 mod board_source;
 #[cfg(test)]

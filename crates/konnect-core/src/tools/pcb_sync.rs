@@ -1609,8 +1609,11 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             *routed_nets.entry(net.clone()).or_insert(0) += 1;
         }
     }
+    // Every item KiCad holds, measured as KiCad measures it (#688). Only a
+    // board with no items at all has no extent, and stages from the origin.
     let extents = client
-        .get_optional_board_extents_in(document.clone())?
+        .get_board_bounds_in(document.clone())?
+        .extents
         .unwrap_or(konnect_ipc::IpcBoardExtents {
             min: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
             max: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
@@ -4079,15 +4082,9 @@ mod tests {
                     ));
                 }
                 if command.type_url.ends_with("GetBoundingBox") {
-                    return Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::commands::GetBoundingBoxResponse {
-                            items: Vec::new(),
-                            boxes: vec![kiapi::common::types::Box2 {
-                                position: Some(konnect_ipc::builders::vec2(0.0, 0.0)),
-                                size: Some(konnect_ipc::builders::vec2(50.0, 40.0)),
-                            }],
-                        },
-                        "kiapi.common.commands.GetBoundingBoxResponse",
+                    return Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
+                        command,
+                        |_| (0.0, 0.0, 50.0, 40.0),
                     ));
                 }
                 if command.type_url.ends_with("BeginCommit") {
@@ -4551,6 +4548,12 @@ mod tests {
 
     impl ServedSync {
         async fn new() -> Self {
+            Self::holding_outline(None).await
+        }
+
+        /// As [`Self::new`], with KiCad also holding one board graphic whose
+        /// box is `outline`, `(x, y, width, height)` in mm.
+        async fn holding_outline(outline: Option<(f64, f64, f64, f64)>) -> Self {
             use crate::tools::cli::test_support::write_script;
             use konnect_ipc::gen::kiapi;
 
@@ -4574,14 +4577,28 @@ mod tests {
                     "@echo off\r\n:loop\r\nif \"%~1\"==\"\" exit /b 2\r\nif \"%~1\"==\"--output\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\ncopy /Y \"{windows_source}\" \"%~1\" >nul\r\nexit /b %ERRORLEVEL%\r\n"
                 ),
             );
-            let kicad =
-                crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, |command| {
+            let kicad = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
+                &board,
+                move |command| {
                     if command.type_url.ends_with("GetItems") {
+                        let request =
+                            kiapi::common::commands::GetItems::decode(command.value.as_slice())
+                                .expect("GetItems request");
+                        let shapes = kiapi::common::types::KiCadObjectType::KotPcbShape as i32;
+                        let items = match outline {
+                            Some(_) if request.types.contains(&shapes) => {
+                                vec![crate::tools::pcb_board::board_mock::listed_item(
+                                    kiapi::common::types::KiCadObjectType::KotPcbShape,
+                                    "outline",
+                                )]
+                            }
+                            _ => Vec::new(),
+                        };
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::GetItemsResponse {
                                 header: None,
                                 status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                                items: Vec::new(),
+                                items,
                             },
                             "kiapi.common.commands.GetItemsResponse",
                         ));
@@ -4593,19 +4610,17 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("GetBoundingBox") {
-                        return Some(konnect_ipc::builders::pack_any(
-                            &kiapi::common::commands::GetBoundingBoxResponse {
-                                items: Vec::new(),
-                                boxes: vec![kiapi::common::types::Box2 {
-                                    position: Some(konnect_ipc::builders::vec2(0.0, 0.0)),
-                                    size: Some(konnect_ipc::builders::vec2(50.0, 40.0)),
-                                }],
+                        return Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
+                            command,
+                            |kiid| {
+                                assert_eq!(kiid, "outline", "only the outline is listed");
+                                outline.expect("an outline to measure")
                             },
-                            "kiapi.common.commands.GetBoundingBoxResponse",
                         ));
                     }
                     None
-                });
+                },
+            );
             let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
                 kicad_cli: cli.to_string_lossy().to_string(),
                 kicad_binary: String::new(),
@@ -4657,6 +4672,33 @@ mod tests {
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap(),
             )
         }
+    }
+
+    /// #688 through the served boundary: a part the board lacks is staged
+    /// 5 mm to the right of what KiCad holds, measured item by item.
+    ///
+    /// KiCad answers `GetBoundingBox` only for the KIIDs a request names. The
+    /// snapshot used to send an empty request, read the empty answer as an
+    /// empty board, and stage every addition beside the page origin instead.
+    #[tokio::test]
+    async fn additions_are_staged_beside_the_board_kicad_holds() {
+        // An outline away from the origin, as a real board is.
+        let served = ServedSync::holding_outline(Some((100.0, 80.0, 50.0, 40.0))).await;
+
+        let plan = served
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let added = &plan["changes"][0];
+        assert_eq!(added["kind"], "add", "{plan:#}");
+        let x = added["position"]["x"].as_f64().unwrap();
+        let y = added["position"]["y"].as_f64().unwrap();
+        // The staging column starts 5 mm past the board's right edge (150 mm)
+        // and the first part is centred half its width further on.
+        assert!(x > 155.0 && x < 165.0, "staged at x = {x}: {plan:#}");
+        // Stacked down from the board's top edge (80 mm), not from y = 0.
+        assert!(y > 80.0 && y < 90.0, "staged at y = {y}: {plan:#}");
     }
 
     /// #657 through the served boundary. The run that found it needed two

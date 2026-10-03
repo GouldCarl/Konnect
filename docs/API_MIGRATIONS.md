@@ -28,6 +28,50 @@ stdio transport's JSON-RPC stream. Its stderr is read by the server and written
 to the server log as `schematic_viewer` warnings, so that output now stops when
 the server exits (#702).
 
+## Unreleased: `get_board_extents` reads the live board and measures every item (minor release)
+
+`get_board_extents` used to ask KiCad for the box of an empty item list.
+KiCad 10.0.5 answers that with no boxes on every board, so the IPC branch never
+answered. The tool then discarded the failure and answered from the saved file,
+using only top-level `gr_line` endpoints and footprint anchor points (#688).
+
+It now lists each class of board item and has KiCad measure every one in
+`BBM_ITEM_ONLY` mode, which leaves footprint text out. It reads through the same
+board-source contract as `get_layer_list`:
+
+- **New argument:** an optional `board_source` (`auto`, `live`, `saved`). The
+  default, `auto`, answers from KiCad when it holds the board.
+- **When KiCad holds the board but cannot complete the read,** the call is
+  refused rather than answered from a file that may be older than the editor.
+- **The saved file is measured the way KiCad measures a live board:** pads,
+  graphics with stroke width, tracks and arcs with width, vias and zone outlines.
+  It agrees with KiCad item by item on its demo boards.
+- **What the file cannot be measured for, it names:** board text, dimensions,
+  text boxes, targets and the like are counted in `unmeasured_item_counts`.
+
+Response changes:
+
+- **New fields:**
+  - `item_count`;
+  - `measured_item_counts` and `unmeasured_item_counts`, objects keyed by item class;
+  - `skipped_item_count` (unreadable items in the saved file);
+  - `shared_kiid_count` (items KiCad listed under a KIID it had already listed);
+  - `sources` (`{"bounds": "ipc"}` or `{"bounds": "saved_board"}`);
+  - `source_evidence`.
+- **`source`** still reads `ipc` or `file`.
+- **A board with no items** now returns `null` for `x_min`, `y_min`, `x_max`,
+  `y_max`, `width` and `height`, with `item_count: 0`. It used to return a zero
+  box with `source: "empty"`.
+- **Values change:** a saved-file answer now includes pads, tracks, vias, zones
+  and stroke widths, so it is usually larger than before; a live answer is
+  KiCad's own measurement.
+
+`update_pcb_from_schematic` measures the live board the same way, and stages new
+footprints 5 mm to the right of it. It used to stage them beside the page origin
+(0, 0), because it read KiCad's empty answer as an empty board. Staged positions,
+and therefore `plan_revision`, differ from plans computed before this change.
+Apply already requires a fresh dry run.
+
 ## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
 
 A hook's `matcher` is built from the tool registry, so it changes when a board
