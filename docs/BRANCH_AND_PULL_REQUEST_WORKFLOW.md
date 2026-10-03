@@ -185,12 +185,11 @@ A PR is not merge-ready merely because an earlier cumulative head was green.
 
 ## Maintainer refresh of a clean behind branch
 
-When the next-to-land PR is only behind current `main`, a maintainer may refresh
-the contributor branch instead of sending it back for a mechanical rebase. This
+When the next-to-land PR is behind current `main`, a maintainer may refresh
+the contributor branch instead of sending it back for mechanical integration. This
 path applies only when all of the following are true:
 
 - the PR is next in the documented merge order;
-- GitHub reports no merge conflict;
 - the commit list and diff contain only the PR's unique work;
 - the contributor permits maintainer edits; and
 - no unresolved finding requires the author to change the implementation.
@@ -212,11 +211,14 @@ and invalidates earlier readiness. Afterward:
 4. record an exact-head review before applying `status:ready-to-merge` or
    enabling auto-merge.
 
-When the semantic diff is unchanged, this can be a focused refresh review that
+If GitHub reports `DIRTY`, resolve conflicts caused by intervening `main`
+changes when the resolution is mechanical and preserves the PR's unique
+behavior. Record the conflict resolution and include it in the semantic-diff
+comparison. When the semantic diff is unchanged, this can be a focused refresh review that
 references the completed substantive review and the current-main CI. It does not
-require repeating every original test or review step. A conflict, changed unique
-diff, failed check, disabled maintainer edits or copied prerequisite history is
-real work: set the appropriate status and return it to the author.
+require repeating every original test or review step. An ambiguous conflict,
+changed unique diff, failed check, disabled maintainer edits or copied
+prerequisite history is author work: set the appropriate status and return it.
 
 ## Merge execution loop
 
@@ -230,8 +232,9 @@ The next actor is represented by exactly one workflow label:
 
 For the one next-to-land PR in an overlap set:
 
-1. If the branch is behind, apply the clean maintainer refresh above or return
-   conflicts/cumulative history to the author. Do not refresh deeper queued PRs.
+1. If the branch is behind or mechanically conflicted, apply the maintainer
+   refresh above. Return ambiguous conflicts or cumulative history to the
+   author. Do not refresh deeper queued PRs.
 2. A maintainer verifies the head SHA, focused diff, dependency position,
    issue-closing references, evidence, and every resolved review conversation.
 3. If something remains, the maintainer applies the label for the actual next
@@ -266,10 +269,11 @@ GitHub chooses a safe order.
 
 ## Responsibilities when `main` moves
 
-The queue owner refreshes the next-to-land PR when it qualifies for the clean
-maintainer path above. The PR author owns resolving conflicts, repairing failed
-checks and reconstructing cumulative or misleading history. A maintainer may
-help with that work, but branch reconstruction is not a standing service.
+The queue owner refreshes the next-to-land PR when it qualifies for the
+maintainer path above, including mechanical conflict resolution. The PR author
+owns ambiguous semantic conflicts, repairing failed checks and reconstructing
+cumulative or misleading history. A maintainer may help with that work, but
+branch reconstruction is not a standing service.
 
 When a stale PR contains copied prerequisite commits, the preferred correction
 is to reconstruct it from current `main` with only its unique commits. A
