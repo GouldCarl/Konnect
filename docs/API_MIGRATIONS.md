@@ -3,6 +3,15 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: grid-snapped coordinates are written as KiCad writes them (patch release)
+
+A point snapped to the 1.27 mm grid is now rounded to the six decimals KiCad
+writes. `bulk_move_schematic_components` used to write a symbol at
+132 × 1.27 as `(at … 167.64000000000001 …)` and report the same value as
+`placements[].new_y`. It now writes and reports `167.64`, and `add_wire`'s
+`added_wire` echo is rounded the same way. The values differ by less than
+1e-12 mm; nothing else in the request or response changes (#744).
+
 ## Unreleased: `open_schematic_viewer` reports a viewer that exits during startup (patch release)
 
 `open_schematic_viewer` used to return `launched: true` as soon as the viewer

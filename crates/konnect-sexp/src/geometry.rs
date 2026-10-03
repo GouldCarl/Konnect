@@ -298,9 +298,17 @@ pub fn arc_bbox(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> (f64, f6
     (min_x, min_y, max_x, max_y)
 }
 
+/// Round to the six decimals KiCAD writes, so arithmetic noise never reaches
+/// the file. `+ 0.0` turns `-0` into the `0` KiCAD writes.
+pub fn round6(v: f64) -> f64 {
+    (v * 1_000_000.0).round() / 1_000_000.0 + 0.0
+}
+
 /// Snap a coordinate to KiCAD's schematic grid (default 1.27 mm = 50 mil).
+///
+/// Rounded, because 132 × 1.27 is `167.64000000000001` in `f64` (#744).
 pub fn snap_to_grid(value: f64, grid: f64) -> f64 {
-    (value / grid).round() * grid
+    round6((value / grid).round() * grid)
 }
 
 /// Snap a point to the schematic grid.
@@ -712,6 +720,8 @@ mod tests {
     fn snap_grid() {
         assert_eq!(snap_to_grid(1.3, 1.27), 1.27);
         assert_eq!(snap_to_grid(2.6, 1.27), 2.54);
+        assert_eq!(snap_to_grid(167.64, 1.27), 167.64);
+        assert!(snap_to_grid(-0.3, 1.27).is_sign_positive());
     }
 
     #[test]

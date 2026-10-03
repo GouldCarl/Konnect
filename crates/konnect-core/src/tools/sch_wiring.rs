@@ -11,7 +11,7 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::{
-    geometry::snap_point,
+    geometry::{round6, snap_point},
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
@@ -748,21 +748,6 @@ fn wires_in_ranges(content: &str, ranges: &[(usize, usize)]) -> Vec<Wire> {
         .unwrap_or_default()
 }
 
-/// Drop the junction dots the removed wires left with nothing to justify them.
-///
-/// Deleting a wire used to leave its dots behind, so relocating a block — delete
-/// its wires, re-add them elsewhere — stranded junctions at the old coordinates.
-/// A dot needs two wires to mean anything, with one exception: one wire plus a
-/// pin landing mid-segment, which is exactly what `pins_mid_segment` creates.
-/// So a junction is pruned when no wire is left through it, or one is and no pin
-/// sits there. Junctions no removed wire touched are left alone, and moves that
-/// strand a dot without deleting a wire are #120's half of the problem.
-/// Round to the six decimals KiCAD writes, so arithmetic noise never reaches
-/// the file.
-fn round6(v: f64) -> f64 {
-    (v * 1_000_000.0).round() / 1_000_000.0
-}
-
 /// A no-connect marker's owner, as far as a placement change is concerned.
 ///
 /// The marker is a sheet item at a coordinate, but what it means is "this pin
@@ -1455,6 +1440,15 @@ pub(crate) fn reconcile_junctions_at(
     (out, added, pruned)
 }
 
+/// Drop the junction dots the removed wires left with nothing to justify them.
+///
+/// Deleting a wire used to leave its dots behind, so relocating a block — delete
+/// its wires, re-add them elsewhere — stranded junctions at the old coordinates.
+/// A dot needs two wires to mean anything, with one exception: one wire plus a
+/// pin landing mid-segment, which is exactly what `pins_mid_segment` creates.
+/// So a junction is pruned when no wire is left through it, or one is and no pin
+/// sits there. Junctions no removed wire touched are left alone, and moves that
+/// strand a dot without deleting a wire are #120's half of the problem.
 fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
     const TOL: f64 = 0.01;
     // Two is as high as this needs to count, so it stops there.
@@ -2937,6 +2931,31 @@ mod unit_aware_wiring_tests {
                 .iter()
                 .any(|&(x, y)| (x - 101.6).abs() < 0.01 && (y - 76.2).abs() < 0.01),
             "junction expected at the mid-wire pin, got {juncs:?}"
+        );
+    }
+
+    /// #744: the response echoes the snapped point, and 132 × 1.27 is
+    /// `167.64000000000001` in `f64`.
+    #[tokio::test]
+    async fn add_wire_reports_the_snapped_point_as_kicad_writes_it() {
+        let (_d, path) = bare_schematic();
+        let result = handle_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 101.6, "y1": 167.64, "x2": 111.76, "y2": 167.64
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            body["added_wire"],
+            json!({ "x1": 101.6, "y1": 167.64, "x2": 111.76, "y2": 167.64 })
         );
     }
 
