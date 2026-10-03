@@ -2991,3 +2991,83 @@ mod component_properties_dispatch_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod label_children_dispatch_tests {
+    //! An unrelated schematic edit must keep every child KiCad wrote on a label,
+    //! `(fields_autoplaced …)` in particular, in the form the file used (#695).
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const KICAD7: &str =
+        include_str!("../../../konnect-schematic-editor/tests/fixtures/labels_kicad7.kicad_sch");
+    const KICAD9: &str =
+        include_str!("../../../konnect-schematic-editor/tests/fixtures/labels_kicad9.kicad_sch");
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Serve one `add_wire` far from every label and return the file it wrote.
+    async fn add_unrelated_wire(source: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let sheet = dir.path().join("labels.kicad_sch");
+        std::fs::write(&sheet, source).unwrap();
+        let response = handler()
+            .await
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 695, "method": "tools/call",
+                "params": { "name": "add_wire", "arguments": {
+                    "schematic": sheet, "x1": 12.7, "y1": 12.7, "x2": 25.4, "y2": 12.7
+                } }
+            }))
+            .await
+            .expect("served tools/call response");
+        let result = response.result.expect("JSON-RPC result");
+        assert_ne!(result["isError"], true, "{result}");
+        let written = std::fs::read_to_string(&sheet).unwrap();
+        assert!(written.contains("(wire"), "the edit was not written");
+        written
+    }
+
+    /// The text that follows `anchor` in `text`, from its next child on.
+    fn after<'a>(text: &'a str, anchor: &str) -> &'a str {
+        let at = text
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} missing"));
+        text[at + anchor.len()..].trim_start()
+    }
+
+    #[tokio::test]
+    async fn a_kicad8_or_later_token_keeps_its_value_and_position() {
+        let written = add_unrelated_wire(KICAD9).await;
+        assert_eq!(written.matches("(fields_autoplaced yes)").count(), 1);
+        assert!(after(&written, "(at 226.695 151.13 180)").starts_with("(fields_autoplaced yes)"));
+        // The label that never had the token still does not.
+        let cc2 = &written[written.find("(label \"CC2\"").unwrap()..];
+        assert!(!cc2[..cc2.find("(uuid").unwrap()].contains("fields_autoplaced"));
+    }
+
+    #[tokio::test]
+    async fn a_kicad7_bare_token_stays_bare_on_both_label_types() {
+        let written = add_unrelated_wire(KICAD7).await;
+        assert_eq!(
+            written.matches("(fields_autoplaced)").count(),
+            2,
+            "{written}"
+        );
+        assert!(!written.contains("fields_autoplaced yes"), "{written}");
+        assert!(after(&written, "(at 187.96 275.59 0)").starts_with("(fields_autoplaced)"));
+        assert!(after(&written, "(at 394.97 69.85 0)").starts_with("(fields_autoplaced)"));
+    }
+}
