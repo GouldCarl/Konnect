@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `open_schematic_viewer` reports a viewer that exits during startup (patch release)
+
+`open_schematic_viewer` used to return `launched: true` as soon as the viewer
+process spawned, even when it crashed straight away, for example on Linux with
+no `DISPLAY` or `WAYLAND_DISPLAY`. It now watches the viewer for one second. If
+the viewer exits in that time, the call is an error whose message gives the exit
+status and the last 20 lines of the viewer's stderr, each cut to 500
+characters. A viewer that is still running after that second gets the same
+successful response as before. Every successful call now takes about one second
+longer, and on the stdio transport no other request is answered during it.
+
+The viewer no longer inherits the server's stdin and stdout, which carry the
+stdio transport's JSON-RPC stream. Its stderr is read by the server and written
+to the server log as `schematic_viewer` warnings, so that output now stops when
+the server exits (#702).
+
 ## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
 
 A hook's `matcher` is built from the tool registry, so it changes when a board
