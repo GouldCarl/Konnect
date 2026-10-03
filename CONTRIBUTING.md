@@ -17,7 +17,8 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
   mergeable step at a time instead of opening cumulative PRs against the same old base.
 - For a pull request from a fork, leave **Allow edits by maintainers** enabled for the
   PR branch. This lets a maintainer perform the one clean rebase needed when the PR
-  reaches the front of the queue; conflicts and substantive changes still return to
+  reaches the front of the queue and resolve mechanical conflicts caused by intervening
+  `main` changes. Ambiguous semantic conflicts and substantive changes still return to
   the author. If maintainer edits cannot be enabled, the author owns that refresh.
 - Keep the PR's workflow state honest. A maintainer uses one `status:*` label to name
   the next actor; `status:ready-to-merge` means the exact current head has completed
@@ -113,8 +114,9 @@ The repository requires a pull request, all ten hosted checks, resolved review
 conversations, an up-to-date branch, and the merge-commit method. GitHub enforces that
 the branch includes current `main`. When a reviewed PR reaches the front of the queue
 and is merely behind, a maintainer may update it with rebase and let hosted CI rerun;
-the contributor is needed for conflicts, copied prerequisite history, failed checks or
-substantive changes. Once a maintainer has reviewed the refreshed exact head and marked
+the maintainer may also resolve a mechanical conflict that preserves the unique change.
+The contributor is needed for ambiguous conflicts, copied prerequisite history, failed
+checks or substantive changes. Once a maintainer has reviewed the refreshed exact head and marked
 it `status:ready-to-merge`, they may enable auto-merge while checks are finishing.
 Auto-merge is the last execution step; it is not review and does not make a cumulative
 or poorly evidenced PR ready.

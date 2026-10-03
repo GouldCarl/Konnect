@@ -103,12 +103,14 @@ independent.
    apply `status:waiting-on-author`, and stop processing that PR. Do not patch
    another maintainer's PR during the same review pass or arm auto-merge unless
    explicitly asked to take over that specific finding.
-3. Refresh only the next-to-land PR when `main` moves. If the branch is merely
-   behind, has no conflicts, contains only its own change and permits maintainer
-   edits, a maintainer may run `gh pr update-branch N --rebase`. Record the old
-   head and current base before updating. A conflict, cumulative/copied history,
-   disabled maintainer edits or a changed unique diff returns the PR to its
-   author instead.
+3. Refresh only the next-to-land PR when `main` moves. Record the old head and
+   current base first. If it is merely behind, use
+   `gh pr update-branch N --rebase`. If it is `DIRTY`, treat a mechanical
+   conflict caused by intervening `main` changes as maintainer integration work
+   when permissions allow: resolve it, preserve the PR's unique behavior, and
+   verify the semantic diff before publishing the rewritten head. Return
+   cumulative/copied history, unavailable edit permission, an ambiguous
+   conflict, or changed behavior to the author.
 4. Treat the refreshed SHA as a new exact head. Required CI must rerun. When the
    unique commits and diff are semantically unchanged, the maintainer may record
    a focused review of the refresh against the completed substantive review;
