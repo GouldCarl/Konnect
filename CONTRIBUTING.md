@@ -126,6 +126,13 @@ stops before the first next-to-land PR by another author for explicit authorizat
 of that exact head. This changes waiting time, not the readiness standard or landing
 order.
 
+A substantive review finding stops the PR regardless of who authored it. The
+maintainer records the complete finding, applies `status:waiting-on-author`, and
+leaves auto-merge off. Standing authorization applies only after the author resolves
+the finding and the new exact head receives a no-findings review with all ten required
+checks green. Reviewers do not silently repair another maintainer's PR and merge it in
+the same pass unless they were explicitly asked to take over that specific finding.
+
 CODEOWNERS may automatically request Chris's review even when another maintainer
 handles the routine review. That request is a notification, not an extra approval
 gate. The [review-request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md#review-requests-and-completion)

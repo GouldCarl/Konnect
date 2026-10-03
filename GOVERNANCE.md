@@ -45,6 +45,13 @@ independent.
   the first next-to-land PR authored by anyone else and obtain explicit
   maintainer authorization for that exact head; do not skip it merely to reach
   a maintainer-authored PR later in the queue.
+- **A substantive review finding is a stop condition for every author.** Record
+  the complete finding, apply `status:waiting-on-author`, and leave auto-merge
+  off. Standing authorization begins only after the author resolves every
+  finding and the new exact head receives a no-findings review with all ten
+  required checks green. A reviewing maintainer does not silently repair
+  another maintainer's PR and merge it in the same review pass; taking over a
+  specific finding requires an explicit request.
 - **Merge commits only** (`gh pr merge N --merge`), so authorship survives.
 - **The active `main: CI must pass` ruleset is the protection source of truth.**
   It requires pull requests, all ten CI checks, and resolved review threads;
@@ -92,8 +99,10 @@ independent.
 
 1. Review the PR's exact head, issue accounting, focused diff, compatibility
    impact, and available evidence. Resolve every review conversation.
-2. If work remains, apply the one `status:*` label naming the next actor. Do not
-   arm auto-merge.
+2. If a substantive finding remains, record one complete actionable review,
+   apply `status:waiting-on-author`, and stop processing that PR. Do not patch
+   another maintainer's PR during the same review pass or arm auto-merge unless
+   explicitly asked to take over that specific finding.
 3. Refresh only the next-to-land PR when `main` moves. If the branch is merely
    behind, has no conflicts, contains only its own change and permits maintainer
    edits, a maintainer may run `gh pr update-branch N --rebase`. Record the old
