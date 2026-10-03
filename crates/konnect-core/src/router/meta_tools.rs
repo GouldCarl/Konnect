@@ -859,6 +859,9 @@ mod reload_tests {
         assert!(control.take().is_none());
     }
 
+    // Only the Linux/Android test below reads it; ungated, it is dead code
+    // under `clippy -D warnings` on Windows and macOS.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     const REPLACED_BINARY_CHILD: &str = "KONNECT_TEST_REPLACED_BINARY_CHILD";
 
     /// Runs this test binary as the "server" from a link in a scratch dir,
