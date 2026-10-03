@@ -95,5 +95,7 @@ mark individual inapplicable rows with a reason. Do not invent runtime evidence.
 - [ ] The completed review is recorded; only stale automatic CODEOWNERS requests
   were cleared under the review-request workflow (manual requests remain open).
 - [ ] All required checks and review conversations satisfy the `main` ruleset.
+- [ ] Merge authorization is established: standing authorization applies to a
+  `@mixelpixx`/`@neusse` PR, or explicit authorization names this exact head.
 - [ ] Auto-merge uses a merge commit, or an already-green PR will be merged with `gh pr merge N --merge`.
 - [ ] Terminal issue closure and the next PR to promote are identified.

@@ -119,6 +119,13 @@ it `status:ready-to-merge`, they may enable auto-merge while checks are finishin
 Auto-merge is the last execution step; it is not review and does not make a cumulative
 or poorly evidenced PR ready.
 
+PRs authored by `@mixelpixx` or `@neusse` have standing merge authorization after
+the exact current head satisfies the same review, CI, closure, and queue gates. The
+queue maintainer continues through consecutive ready PRs by either maintainer, but
+stops before the first next-to-land PR by another author for explicit authorization
+of that exact head. This changes waiting time, not the readiness standard or landing
+order.
+
 CODEOWNERS may automatically request Chris's review even when another maintainer
 handles the routine review. That request is a notification, not an extra approval
 gate. The [review-request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md#review-requests-and-completion)

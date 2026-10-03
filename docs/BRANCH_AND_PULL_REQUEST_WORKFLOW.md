@@ -239,12 +239,19 @@ For the one next-to-land PR in an overlap set:
 4. If the PR is ready but required checks are still running, the maintainer
    applies `status:ready-to-merge` and enables auto-merge with the merge-commit
    method. If all requirements are already satisfied, the maintainer may merge
-   immediately with `gh pr merge N --merge` after the same verification.
+   immediately with `gh pr merge N --merge` after the same verification. A PR
+   authored by `@mixelpixx` or `@neusse` has standing merge authorization once
+   this exact-head gate is satisfied; any other author's PR requires explicit
+   maintainer authorization for that exact head.
 5. A new commit, rewritten head, base change, failed or missing required check,
    or unresolved conversation returns the PR to review. Recheck the new exact
    head before arming auto-merge again.
 6. After GitHub merges it, update local `main`, verify terminal issue closure,
    post the acceptance mapping, and only then promote the immediate successor.
+   Continue the loop automatically while each immediate successor is ready and
+   authored by `@mixelpixx` or `@neusse`. Stop before the first PR by another
+   author, even when a maintainer-authored PR appears later; the queue order is
+   not bypassed to consume standing authorization.
    Run the complete local gate only under the conditional rules in
    `GOVERNANCE.md`.
 
