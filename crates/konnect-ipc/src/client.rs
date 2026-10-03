@@ -4232,66 +4232,155 @@ impl KiCadIpcClient {
             })
     }
 
-    /// Get board extents (bounding box of all items).
-    pub fn get_board_extents(&self) -> Result<IpcBoardExtents> {
-        self.get_board_extents_in(self.get_board_document()?)
-    }
-
-    /// As [`Self::get_board_extents`], targeting a specific open document.
-    pub fn get_board_extents_in(
+    /// Measure every item of an exact open board (#688).
+    ///
+    /// KiCad answers `GetBoundingBox` only for the KIIDs a request names: an
+    /// empty list returns no boxes on every board (measured on KiCad 10.0.5),
+    /// which is how this read used to report an empty board for all of them.
+    /// So each class of board item is listed with `GetItems`, one class per
+    /// request so that a class KiCad refuses fails the read by name instead of
+    /// vanishing from it, and every KIID is measured in one `BBM_ITEM_ONLY`
+    /// request through [`Self::get_item_boxes_in`], which requires exactly one
+    /// box back for each.
+    ///
+    /// `BBM_ITEM_ONLY` leaves a footprint's text out of its box: board extents
+    /// mean board geometry, and footprint text can sit tens of millimetres off
+    /// a real board.
+    ///
+    /// KiCad 10.0.5 can list a KIID more than once (zones it generates on load
+    /// share them). Each KIID is measured once, and the response says how many
+    /// were shared rather than failing the read.
+    pub fn get_board_bounds_in(
         &self,
         document: kiapi::common::types::DocumentSpecifier,
-    ) -> Result<IpcBoardExtents> {
-        self.get_optional_board_extents_in(document)?
-            .context("No bounding box returned from KiCAD")
-    }
+    ) -> Result<IpcBoardBounds> {
+        use kiapi::board::types as board;
+        use kiapi::common::types::KiCadObjectType as Kind;
 
-    /// Return no bounds for a completely empty board instead of treating the
-    /// valid empty `GetBoundingBox` response as an IPC failure.
-    pub fn get_optional_board_extents_in(
-        &self,
-        document: kiapi::common::types::DocumentSpecifier,
-    ) -> Result<Option<IpcBoardExtents>> {
-        // Use GetBoundingBox with no specific items = board extents
-        let header = header_for(document);
-        let cmd = kiapi::common::commands::GetBoundingBox {
-            header: Some(header),
-            items: vec![], // empty = all items
-            mode: kiapi::common::commands::BoundingBoxMode::BbmItemOnly as i32,
-        };
-        let resp_any = self.send_command(&cmd, "kiapi.common.commands.GetBoundingBox")?;
-        if let Some(any) = resp_any {
-            let resp: kiapi::common::commands::GetBoundingBoxResponse = unpack_any(&any)?;
-            if let Some(bbox) = resp.boxes.first() {
-                let pos = bbox.position.as_ref();
-                let size = bbox.size.as_ref();
-                return Ok(Some(IpcBoardExtents {
-                    min: IpcVector2 {
-                        x: pos
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0),
-                        y: pos
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0),
-                    },
-                    max: IpcVector2 {
-                        x: pos
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0)
-                            + size
-                                .map(|s| crate::builders::nm_to_mm(s.x_nm))
-                                .unwrap_or(0.0),
-                        y: pos
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0)
-                            + size
-                                .map(|s| crate::builders::nm_to_mm(s.y_nm))
-                                .unwrap_or(0.0),
-                    },
-                }));
+        fn kiid<M: Message + Default>(
+            item: &prost_types::Any,
+            id: impl Fn(&M) -> Option<&kiapi::common::types::Kiid>,
+        ) -> Result<String> {
+            let message = M::decode(item.value.as_slice())
+                .with_context(|| format!("KiCad sent an unreadable {}", item.type_url))?;
+            id(&message)
+                .map(|id| id.value.clone())
+                .filter(|id| !id.is_empty())
+                .with_context(|| format!("KiCad sent a {} without a KIID", item.type_url))
+        }
+
+        // (GetItems class, the message KiCad answers with, the response key)
+        const CLASSES: [(Kind, &str, &str); 11] = [
+            (
+                Kind::KotPcbFootprint,
+                "kiapi.board.types.FootprintInstance",
+                "footprints",
+            ),
+            (
+                Kind::KotPcbShape,
+                "kiapi.board.types.BoardGraphicShape",
+                "shapes",
+            ),
+            (Kind::KotPcbText, "kiapi.board.types.BoardText", "text"),
+            (
+                Kind::KotPcbTextbox,
+                "kiapi.board.types.BoardTextBox",
+                "text_boxes",
+            ),
+            (Kind::KotPcbTrace, "kiapi.board.types.Track", "tracks"),
+            (Kind::KotPcbArc, "kiapi.board.types.Arc", "arcs"),
+            (Kind::KotPcbVia, "kiapi.board.types.Via", "vias"),
+            (Kind::KotPcbZone, "kiapi.board.types.Zone", "zones"),
+            (
+                Kind::KotPcbDimension,
+                "kiapi.board.types.Dimension",
+                "dimensions",
+            ),
+            (Kind::KotPcbBarcode, "kiapi.board.types.Barcode", "barcodes"),
+            (
+                Kind::KotPcbReferenceImage,
+                "kiapi.board.types.ReferenceImage",
+                "reference_images",
+            ),
+        ];
+
+        let mut ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut measured = std::collections::BTreeMap::new();
+        let mut shared_kiid_count = 0;
+        for (kind, message, key) in CLASSES {
+            let items = self
+                .get_items_of_types_in(document.clone(), &[kind])
+                .with_context(|| format!("KiCad did not list the board's {key}"))?;
+            for item in &items {
+                anyhow::ensure!(
+                    crate::builders::any_is(item, message),
+                    "KiCad answered a request for {key} with a {}",
+                    item.type_url
+                );
+                let id = match kind {
+                    Kind::KotPcbFootprint => {
+                        kiid::<board::FootprintInstance>(item, |m| m.id.as_ref())
+                    }
+                    Kind::KotPcbShape => kiid::<board::BoardGraphicShape>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbText => kiid::<board::BoardText>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbTextbox => kiid::<board::BoardTextBox>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbTrace => kiid::<board::Track>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbArc => kiid::<board::Arc>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbVia => kiid::<board::Via>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbZone => kiid::<board::Zone>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbDimension => kiid::<board::Dimension>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbBarcode => kiid::<board::Barcode>(item, |m| m.id.as_ref()),
+                    _ => kiid::<board::ReferenceImage>(item, |m| m.id.as_ref()),
+                }?;
+                if seen.insert(id.clone()) {
+                    ids.push(id);
+                } else {
+                    shared_kiid_count += 1;
+                }
+            }
+            if !items.is_empty() {
+                measured.insert(key.to_string(), items.len());
             }
         }
-        Ok(None)
+
+        let boxes = self.get_item_boxes_in(document, &ids)?;
+        let mut extents: Option<IpcBoardExtents> = None;
+        for bounds in boxes.values() {
+            let (position, size) = (bounds.position.as_ref(), bounds.size.as_ref());
+            let (Some(position), Some(size)) = (position, size) else {
+                anyhow::bail!("KiCad returned a bounding box without a position or size");
+            };
+            let (x0, y0) = (
+                crate::builders::nm_to_mm(position.x_nm),
+                crate::builders::nm_to_mm(position.y_nm),
+            );
+            let (x1, y1) = (
+                crate::builders::nm_to_mm(position.x_nm + size.x_nm),
+                crate::builders::nm_to_mm(position.y_nm + size.y_nm),
+            );
+            extents = Some(match extents {
+                None => IpcBoardExtents {
+                    min: IpcVector2 { x: x0, y: y0 },
+                    max: IpcVector2 { x: x1, y: y1 },
+                },
+                Some(e) => IpcBoardExtents {
+                    min: IpcVector2 {
+                        x: e.min.x.min(x0),
+                        y: e.min.y.min(y0),
+                    },
+                    max: IpcVector2 {
+                        x: e.max.x.max(x1),
+                        y: e.max.y.max(y1),
+                    },
+                },
+            });
+        }
+        Ok(IpcBoardBounds {
+            extents,
+            measured,
+            shared_kiid_count,
+        })
     }
 
     /// Get enabled layers.

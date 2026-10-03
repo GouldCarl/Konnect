@@ -1,8 +1,9 @@
 //! `pcb_board` toolset — board setup, layers, outlines, zones, and board-level items.
 //!
 //! Most operations use S-expression file manipulation so they work without a running
-//! KiCad instance. `get_board_info` and `get_board_extents` try the IPC API first,
-//! falling back to parsing the file, and report which they used as `source` —
+//! KiCad instance. `get_board_info` tries the IPC API first, falling back to parsing
+//! the file; `get_layer_list` and `get_board_extents` read through the board-source
+//! seam (`board_source`). Each reports which source it used —
 //! the file is the last save, so it disagrees with the IPC-backed writers here
 //! whenever KiCad holds unsaved edits.
 
@@ -1093,16 +1094,22 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_board_extents",
-            "Return the bounding box of all objects on the board (tries KiCAD IPC, falls back to file parse).",
+            "Return the box enclosing the board's items: footprints (without their \
+             text), graphics, tracks, vias and zones, plus board text and dimensions \
+             when KiCad measures them. Reads the board KiCad holds open where it can, \
+             so unsaved edits count; 'board_source' selects that. An answer from the \
+             saved file names, in 'unmeasured_item_counts', what it could not measure.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "board_source": board_source::board_source_schema()
                 },
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_board_extents(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_layer_list",
             "Return the board's enabled layers with their names and types. Reads the \
@@ -1612,69 +1619,116 @@ async fn handle_get_board_extents(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-
-    // Try IPC first; fall through to file-based computation on error.
-    // Addressed to the requested board, not the first open one — with two
-    // boards open, first-document targeting silently measures the other, and
-    // the binding step is what proves the document is this board.
-    if let Ok(ext) = with_board_ipc_classified(ctx, &board_path, move |c, document| {
-        c.get_board_extents_in(document)
-    })
-    .await?
-    {
-        return Ok(CallToolResult::json(&json!({
-            "x_min": ext.min.x, "y_min": ext.min.y,
-            "x_max": ext.max.x, "y_max": ext.max.y,
-            "width": ext.max.x - ext.min.x,
-            "height": ext.max.y - ext.min.y,
-            "source": "ipc"
-        })));
-    }
-
-    // File-based fallback: collect all coordinates from gr_lines and footprint positions
-    let content = std::fs::read_to_string(&board_path)?;
-    let tree = parse_sexp(&content)?;
-
-    let (mut min_x, mut min_y) = (f64::MAX, f64::MAX);
-    let (mut max_x, mut max_y) = (f64::MIN, f64::MIN);
-    let mut update = |x: f64, y: f64| {
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
+    let source = match BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
     };
 
-    for line in tree.find_all("gr_line") {
-        if let (Some(s), Some(e)) = (line.find("start"), line.find("end")) {
-            if let (Some(x1), Some(y1), Some(x2), Some(y2)) =
-                (s.get_f64(1), s.get_f64(2), e.get_f64(1), e.get_f64(2))
-            {
-                update(x1, y1);
-                update(x2, y2);
-            }
-        }
-    }
-    for fp in tree.find_all("footprint") {
-        if let Some(at) = fp.find("at") {
-            if let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) {
-                update(x, y);
-            }
-        }
-    }
+    // Addressed to the requested board, not the first open one: the seam binds
+    // the exact document before the closure runs. A failure is no longer
+    // swallowed into a silent file answer (#688); the seam decides whether the
+    // saved file may stand in and says why.
+    let observation = board_source::read_board(
+        ctx,
+        &board_path,
+        source,
+        "board extents",
+        |client, document| client.get_board_bounds_in(document),
+    )
+    .await?;
 
-    if min_x == f64::MAX {
-        return Ok(CallToolResult::json(
-            &json!({ "x_min": 0, "y_min": 0, "x_max": 0, "y_max": 0, "width": 0, "height": 0, "source": "empty" }),
-        ));
-    }
+    let live = match observation {
+        board_source::BoardRead::Refused(refusal) => return Ok(refusal),
+        board_source::BoardRead::Saved(why) => return Ok(saved_board_extents(&board_path, &why)),
+        board_source::BoardRead::Live(bounds) => bounds,
+    };
+    let item_count: usize = live.measured.values().sum();
+    Ok(board_extents_body(
+        live.extents.map(|e| (e.min.x, e.min.y, e.max.x, e.max.y)),
+        BoardExtentsCounts {
+            item_count,
+            measured: json!(live.measured),
+            unmeasured: json!({}),
+            skipped: 0,
+            shared_kiids: live.shared_kiid_count,
+        },
+        "ipc",
+        board_source::FROM_IPC,
+        board_source::live_evidence(),
+    ))
+}
 
-    Ok(CallToolResult::json(&json!({
-        "x_min": min_x, "y_min": min_y,
-        "x_max": max_x, "y_max": max_y,
-        "width": max_x - min_x,
-        "height": max_y - min_y,
-        "source": "file"
-    })))
+/// What a `get_board_extents` answer counted, on either path.
+struct BoardExtentsCounts {
+    item_count: usize,
+    measured: serde_json::Value,
+    unmeasured: serde_json::Value,
+    skipped: usize,
+    shared_kiids: usize,
+}
+
+/// One response shape for both sources. `bounds` is `None` only when nothing
+/// was measured, and then every coordinate is `null` rather than a zero box
+/// that reads as a board at the origin.
+fn board_extents_body(
+    bounds: Option<konnect_sexp::bounds::Bbox>,
+    counts: BoardExtentsCounts,
+    legacy_source: &str,
+    bounds_source: &str,
+    evidence: serde_json::Value,
+) -> CallToolResult {
+    let (x_min, y_min, x_max, y_max) = match bounds {
+        Some((x0, y0, x1, y1)) => (json!(x0), json!(y0), json!(x1), json!(y1)),
+        None => (json!(null), json!(null), json!(null), json!(null)),
+    };
+    let mut body = json!({
+        "x_min": x_min, "y_min": y_min,
+        "x_max": x_max, "y_max": y_max,
+        "width": bounds.map(|(x0, _, x1, _)| x1 - x0),
+        "height": bounds.map(|(_, y0, _, y1)| y1 - y0),
+        "item_count": counts.item_count,
+        "measured_item_counts": counts.measured,
+        "unmeasured_item_counts": counts.unmeasured,
+        "skipped_item_count": counts.skipped,
+        "shared_kiid_count": counts.shared_kiids,
+        "source": legacy_source,
+    });
+    board_source::provenance(&mut body, json!({ "bounds": bounds_source }), evidence);
+    CallToolResult::json(&body)
+}
+
+/// The saved board, measured the way KiCad measures a live one
+/// ([`konnect_sexp::bounds`]), with what the file cannot be measured for named.
+fn saved_board_extents(
+    board_path: &std::path::Path,
+    why: &board_source::SavedBoard,
+) -> CallToolResult {
+    let tree = match std::fs::read_to_string(board_path)
+        .map_err(|e| e.to_string())
+        .and_then(|content| parse_sexp(&content).map_err(|e| e.to_string()))
+    {
+        Ok(tree) => tree,
+        Err(reason) => {
+            return CallToolResult::error(format!(
+                "The board extents could not be read from '{}': {reason}.",
+                board_path.display()
+            ))
+        }
+    };
+    let bounds = konnect_sexp::bounds::board_item_bounds(&tree);
+    board_extents_body(
+        bounds.union(),
+        BoardExtentsCounts {
+            item_count: bounds.items.len(),
+            measured: json!(bounds.measured()),
+            unmeasured: json!(bounds.not_measured),
+            skipped: bounds.skipped,
+            shared_kiids: 0,
+        },
+        "file",
+        board_source::FROM_SAVED_BOARD,
+        why.evidence(),
+    )
 }
 
 /// The stackup as the saved board file declares it, or why it could not be
@@ -2779,6 +2833,76 @@ pub(crate) mod board_mock {
                 .collect(),
             respond,
         )
+    }
+
+    /// KiCad's answer to a `GetBoundingBox` request: one box for each KIID the
+    /// request names, in its order, and nothing else. An empty request gets an
+    /// empty answer, which is what KiCad 10.0.5 does on every board and why an
+    /// empty request can never measure one (#688). `box_of` gives each KIID's
+    /// box as `(x, y, width, height)` in millimetres.
+    pub fn kicad_bounding_boxes(
+        command: &prost_types::Any,
+        box_of: impl Fn(&str) -> (f64, f64, f64, f64),
+    ) -> prost_types::Any {
+        use prost::Message;
+        let request = kiapi::common::commands::GetBoundingBox::decode(command.value.as_slice())
+            .expect("GetBoundingBox request");
+        let boxes = request
+            .items
+            .iter()
+            .map(|id| {
+                let (x, y, w, h) = box_of(&id.value);
+                kiapi::common::types::Box2 {
+                    position: Some(konnect_ipc::builders::vec2(x, y)),
+                    size: Some(konnect_ipc::builders::vec2(w, h)),
+                }
+            })
+            .collect();
+        konnect_ipc::builders::pack_any(
+            &kiapi::common::commands::GetBoundingBoxResponse {
+                items: request.items,
+                boxes,
+            },
+            "kiapi.common.commands.GetBoundingBoxResponse",
+        )
+    }
+
+    /// One item as `GetItems` lists it: a message of the type KiCad answers `kind` with, carrying
+    /// only its KIID.
+    pub fn listed_item(
+        kind: kiapi::common::types::KiCadObjectType,
+        kiid: &str,
+    ) -> prost_types::Any {
+        let id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        use kiapi::board::types as board;
+        match kind {
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint => {
+                konnect_ipc::builders::pack_any(
+                    &board::FootprintInstance {
+                        id,
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.FootprintInstance",
+                )
+            }
+            kiapi::common::types::KiCadObjectType::KotPcbShape => konnect_ipc::builders::pack_any(
+                &board::BoardGraphicShape {
+                    id,
+                    ..Default::default()
+                },
+                "kiapi.board.types.BoardGraphicShape",
+            ),
+            kiapi::common::types::KiCadObjectType::KotPcbTrace => konnect_ipc::builders::pack_any(
+                &board::Track {
+                    id,
+                    ..Default::default()
+                },
+                "kiapi.board.types.Track",
+            ),
+            other => panic!("the double lists no {other:?}"),
+        }
     }
 
     /// One open PCB document in the form KiCad sends: a `board_filename` and,

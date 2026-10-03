@@ -610,6 +610,20 @@ pub struct IpcBoardExtents {
     pub max: IpcVector2,
 }
 
+/// What [`crate::client::KiCadIpcClient::get_board_bounds_in`] measured on a
+/// live board.
+#[derive(Debug, Clone)]
+pub struct IpcBoardBounds {
+    /// The union of every item's box; `None` only for a board with no items.
+    pub extents: Option<IpcBoardExtents>,
+    /// How many items of each class KiCad listed and measured, by the name a
+    /// response reports the class under. Classes with no items are absent.
+    pub measured: std::collections::BTreeMap<String, usize>,
+    /// Items KiCad listed under a KIID it had already listed. Each KIID is
+    /// measured once, so these have no box of their own.
+    pub shared_kiid_count: usize,
+}
+
 /// Footprint-local placement of the Reference and Value text fields, read
 /// from the library footprint so placed parts keep the library's text
 /// positions. A hardcoded offset put the Reference on top of the part's own
