@@ -276,7 +276,7 @@ const ANNOTATION_LAYERS: [&str; 4] = ["Cmts.User", "Dwgs.User", "Eco1.User", "Ec
 fn footprint_bbox(fp: &SexpNode, out: &mut BoardItemBounds) -> Option<Bbox> {
     let at = fp.find("at")?;
     let (fx, fy) = (finite(at.get_f64(1)?)?, finite(at.get_f64(2)?)?);
-    let rot = finite(at.get_f64(3).unwrap_or(0.0))?;
+    let rot = optional_finite_child(at, 3, 0.0)?;
     let to_board = move |x: f64, y: f64| crate::geometry::transform_pad(x, y, fx, fy, rot);
 
     let private: Vec<&str> = fp
@@ -356,7 +356,7 @@ fn footprint_bbox(fp: &SexpNode, out: &mut BoardItemBounds) -> Option<Bbox> {
 pub fn pad_bbox(pad: &SexpNode, fx: f64, fy: f64, footprint_rot: f64) -> Option<Bbox> {
     let at = pad.find("at")?;
     let (px, py) = (finite(at.get_f64(1)?)?, finite(at.get_f64(2)?)?);
-    let angle = finite(at.get_f64(3).unwrap_or(0.0))?;
+    let angle = optional_finite_child(at, 3, 0.0)?;
     let (cx, cy) = crate::geometry::transform_pad(px, py, fx, fy, footprint_rot);
     let size = pad.find("size")?;
     let (w, h) = (finite(size.get_f64(1)?)?, finite(size.get_f64(2)?)?);
@@ -390,9 +390,10 @@ pub fn pad_bbox(pad: &SexpNode, fx: f64, fy: f64, footprint_rot: f64) -> Option<
             ))
         }
         "roundrect" => {
-            let ratio = pad
-                .find_f64("roundrect_rratio")
-                .map_or(Some(0.25), finite)?;
+            let ratio = match pad.find("roundrect_rratio") {
+                None => 0.25,
+                Some(node) => finite(node.get_f64(1)?)?,
+            };
             let r = ratio * w.min(h);
             let mut acc = None;
             for (x, y) in rect {
@@ -436,6 +437,16 @@ pub fn pad_bbox(pad: &SexpNode, fx: f64, fy: f64, footprint_rot: f64) -> Option<
 
 fn finite(v: f64) -> Option<f64> {
     v.is_finite().then_some(v)
+}
+
+/// Read an optional numeric child without treating malformed present data as
+/// omitted. KiCad omits optional angles when they are zero; a present value
+/// that is not finite numeric data makes the containing item unmeasurable.
+fn optional_finite_child(node: &SexpNode, index: usize, default: f64) -> Option<f64> {
+    match node.get(index) {
+        None => Some(default),
+        Some(value) => finite(value.as_str()?.parse().ok()?),
+    }
 }
 
 fn pair(node: &SexpNode) -> Option<(f64, f64)> {

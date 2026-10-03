@@ -221,3 +221,35 @@ fn every_pad_agrees_with_kicad() {
         assert_eq!(compared, kicad.len(), "{name}: pads KiCad did not list");
     }
 }
+
+#[test]
+fn malformed_optional_geometry_is_skipped_instead_of_defaulted() {
+    for malformed in [
+        // A present footprint angle is not the same thing as KiCad omitting a
+        // zero angle.
+        r#"(footprint "F" (at 10 20 nope) (uuid "fp"))"#,
+        // The same distinction applies to a pad angle.
+        r#"(footprint "F" (at 10 20) (uuid "fp")
+             (pad "1" smd rect (at 0 0 nope) (size 1 1) (layers "F.Cu")))"#,
+        // A malformed present ratio must not become the default 0.25 ratio.
+        r#"(footprint "F" (at 10 20) (uuid "fp")
+             (pad "1" smd roundrect (at 0 0) (size 1 1) (layers "F.Cu")
+               (roundrect_rratio nope)))"#,
+    ] {
+        let tree = parse_sexp(&format!("(kicad_pcb {malformed})")).unwrap();
+        let bounds = board_item_bounds(&tree);
+        assert!(bounds.items.is_empty(), "malformed item was measured");
+        assert_eq!(bounds.skipped, 1, "malformed item was not disclosed");
+    }
+
+    // Actually omitted optional values still receive their declared defaults.
+    let tree = parse_sexp(
+        r#"(kicad_pcb
+             (footprint "F" (at 10 20) (uuid "fp")
+               (pad "1" smd roundrect (at 0 0) (size 1 1) (layers "F.Cu"))))"#,
+    )
+    .unwrap();
+    let bounds = board_item_bounds(&tree);
+    assert_eq!(bounds.items.len(), 1);
+    assert_eq!(bounds.skipped, 0);
+}
